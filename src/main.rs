@@ -1,76 +1,9 @@
 use std::io::Read;
-use tokio::net::TcpSocket;
 use futures::channel::mpsc;
 use tokio::io::AsyncWriteExt;
 use tokio::io::AsyncReadExt;
 use futures::StreamExt;
-
-async fn tcp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
-    eprintln!("Connecting to {}", addr);
-
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }?;
-    let stream = socket.connect(addr).await?;
-
-    let local_addr = stream.local_addr()?;
-    let peer_addr = stream.peer_addr()?;
-    eprintln!("Connected from {} to {}, protocol TCP, protocol {}",
-        local_addr,
-        peer_addr,
-        if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
-
-    Ok(stream)
-}
-
-async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::Result<()> {
-    // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
-    // can be done concurrently with reading/writing the TCP stream.
-
-    // TODO: eventually probably better to make this bounded
-    let (tx_input, mut rx_input) = mpsc::unbounded();
-    std::thread::Builder::new().name("input_reader".to_string()).spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut read_buf = [0u8];
-        while let Ok(_) = stdin.read(&mut read_buf) {
-            if let Err(_) = tx_input.unbounded_send(read_buf) {
-                break;
-            }
-        }
-    })?;
-
-    let mut stdout = tokio::io::stdout();
-    let (mut stream_reader, mut stream_writer) = tcp_stream.split();
-
-    loop {
-        let stdin_to_stream = async {
-            let b = rx_input.next().await.ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "End of stdin input"))?;
-            stream_writer.write_all(&b).await?;
-            Ok(())
-        };
-
-        let stream_to_stdout = async {
-            let b = stream_reader.read_u8().await?;
-            stdout.write_all(&[b]).await?;
-            stdout.flush().await?;
-            Ok(())
-        };
-
-        // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail
-        // out. It most likely means the socket was closed.
-        tokio::select! {
-            result = stdin_to_stream => {
-                if result.is_err() {
-                    return result;
-                }
-            },
-            result = stream_to_stdout => {
-                if result.is_err() {
-                    return result;
-                }
-            },
-            else => return Ok(()),
-        };
-    }
-}
+use std::sync::Arc;
 
 async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
@@ -97,6 +30,178 @@ async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
     }
 }
 
+async fn tcp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    eprintln!("Connecting to {}", addr);
+
+    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+    let stream = socket.connect(addr).await?;
+
+    let local_addr = stream.local_addr()?;
+    let peer_addr = stream.peer_addr()?;
+    eprintln!("Connected from {} to {}, protocol TCP, family {}",
+        local_addr,
+        peer_addr,
+        if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+
+    Ok(stream)
+}
+
+async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::Result<()> {
+    // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
+    // can be done concurrently with reading/writing the TCP stream.
+
+    // TODO: eventually probably better to make this bounded
+    let (tx_input, mut rx_input) = mpsc::unbounded();
+    std::thread::Builder::new().name("input_reader".to_string()).spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut read_buf = [0u8];
+        while let Ok(_) = stdin.read(&mut read_buf) {
+            if let Err(_) = tx_input.unbounded_send(read_buf) {
+                break;
+            }
+        }
+    })?;
+
+    let mut stdout = tokio::io::stdout();
+    let (mut rx_socket, mut tx_socket) = tcp_stream.split();
+
+    loop {
+        let stdin_to_net = async {
+            let b = rx_input.next().await.ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "End of stdin input"))?;
+            tx_socket.write_all(&b).await?;
+            Ok(())
+        };
+
+        let net_to_stdout = async {
+            let b = rx_socket.read_u8().await?;
+            stdout.write_all(&[b]).await?;
+            stdout.flush().await?;
+            Ok(())
+        };
+
+        // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail
+        // out. It most likely means the socket was closed.
+        tokio::select! {
+            result = stdin_to_net => {
+                if result.is_err() {
+                    return result;
+                }
+            },
+            result = net_to_stdout => {
+                if result.is_err() {
+                    return result;
+                }
+            },
+            else => return Ok(()),
+        };
+    }
+}
+
+async fn do_udp_connection(hostname : &str, port : u16) -> std::io::Result<()> {
+    let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
+
+    // Only use the first candidate. For UDP the concept of a "connection" is limited to being the implicit recipient of
+    // a `send()` call. UDP also can't determine success, because the recipient might properly receive the packet but
+    // choose not to indicate any response.
+    for addr in candidates {
+        let socket = udp_connect_to_candidate(addr).await?;
+        return handle_udp_socket(socket).await;
+    }
+
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
+}
+
+async fn udp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    eprintln!("Connecting to {}", addr);
+
+    let socket = tokio::net::UdpSocket::bind(
+        if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }).await?;
+
+    socket.connect(addr).await?;
+
+    let local_addr = socket.local_addr()?;
+    let peer_addr = socket.peer_addr()?;
+    eprintln!("Connected from {} to {}, protocol UDP, family {}",
+        local_addr,
+        peer_addr,
+        if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+
+    Ok(socket)
+}
+
+async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()> {
+    // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
+    // can be done concurrently with reading/writing the TCP stream.
+
+    // TODO: eventually probably better to make this bounded
+    // TODO: could probably refactor this part into a helper
+    let (tx_input, mut rx_input) = mpsc::unbounded();
+    tokio::task::spawn(async move {
+        let mut stdin = std::io::stdin();
+        let mut read_buf = [0u8];
+        while let Ok(_) = stdin.read(&mut read_buf) {
+            if let Err(_) = tx_input.unbounded_send(read_buf) {
+                break;
+            }
+        }
+    });
+
+    let mut stdout = tokio::io::stdout();
+
+    // Make two references to the socket, one for the reader and one for the writer. This is a locked, reference counted
+    // object, so both tasks can access it.
+    let rx_socket = Arc::new(socket);
+    let tx_socket = rx_socket.clone();
+
+    loop {
+        let stdin_to_net = async {
+            // TODO: allow sending larger than 1 byte datagrams
+            let b = rx_input.next().await.ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "End of stdin input"))?;
+            tx_socket.send(&b).await?;
+            Ok(())
+        };
+
+        let net_to_stdout = async {
+            // Arbitrary sized buffer that's larger than a normal 1500 byte MTU.
+            let mut b = [0u8 ; 2048];
+
+            let rx_bytes = rx_socket.recv(&mut b).await?;
+
+            // If the entire buffer filled up (which is bigger than a normal MTU) then whatever is happening is
+            // unsupported.
+            if rx_bytes == b.len() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Received datagram larger than 2KB."));
+            }
+
+            // Output only the amount of bytes received.
+            stdout.write_all(&b[..rx_bytes]).await?;
+
+            stdout.flush().await?;
+            Ok(())
+        };
+
+        // Send stdin bytes to the network, and print out incoming bytes from the network. If any error occurs, bail
+        // out. It most likely means the socket was closed.
+        tokio::select! {
+            result = stdin_to_net => {
+                if result.is_err() {
+                    return result;
+                }
+            },
+            result = net_to_stdout => {
+                if result.is_err() {
+                    return result;
+                }
+            },
+            else => return Ok(()),
+        };
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args : Vec<String> = std::env::args().skip(1).collect();
@@ -105,7 +210,28 @@ async fn main() -> Result<(), String> {
         return Err(String::from("Need hostname and port"));
     }
 
-    let hostname = args[0].clone();
-    let port = args[1].parse::<u16>().or(Err(String::from("Failed to parse port")))?;
-    do_tcp_connect(&hostname, port).await.map_err(|e| { format!("{}: {}", e.kind(), e) })
+    let mut is_tcp = true;
+    let mut next_arg_idx = 0;
+    for i in 0 .. args.len() - 2 {
+        if args[i] == "-u" {
+            is_tcp = false;
+            next_arg_idx = i + 1;
+        }
+    }
+
+    assert!(next_arg_idx <= args.len() - 2);
+
+    let hostname = args[next_arg_idx].clone();
+    next_arg_idx += 1;
+
+    let port = args[next_arg_idx].parse::<u16>().or(Err(String::from("Failed to parse port")))?;
+    next_arg_idx += 1;
+
+    let result = if is_tcp {
+        do_tcp_connect(&hostname, port).await
+    } else {
+        do_udp_connection(&hostname, port).await
+    };
+
+    result.map_err(|e| { format!("{}: {}", e.kind(), e) })
 }
