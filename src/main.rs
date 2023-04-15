@@ -5,6 +5,29 @@ use tokio::io::AsyncReadExt;
 use futures::StreamExt;
 use std::sync::Arc;
 
+// TODO: would be better if this were a task instead of a thread. or maybe use stream/sink
+fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
+    // TODO: might be better to make this bounded eventually
+    let (mut tx_input, rx_input) = mpsc::unbounded();
+    std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut read_buf = [0u8];
+        while let Ok(num_bytes_read) = stdin.read(&mut read_buf) {
+            if num_bytes_read == 0 {
+                // EOF. Disconnect from the channel too.
+                tx_input.disconnect();
+                break;
+            }
+
+            if let Err(_) = tx_input.unbounded_send(read_buf) {
+                break;
+            }
+        }
+    }).expect("Failed to create stdin reader thread");
+
+    rx_input
+}
+
 async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
@@ -50,41 +73,40 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::R
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
     // can be done concurrently with reading/writing the TCP stream.
 
-    // TODO: eventually probably better to make this bounded
-    let (tx_input, mut rx_input) = mpsc::unbounded();
-    std::thread::Builder::new().name("input_reader".to_string()).spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut read_buf = [0u8];
-        while let Ok(_) = stdin.read(&mut read_buf) {
-            if let Err(_) = tx_input.unbounded_send(read_buf) {
-                break;
-            }
-        }
-    })?;
-
+    let mut rx_input = setup_async_stdin_reader_thread();
     let mut stdout = tokio::io::stdout();
     let (mut rx_socket, mut tx_socket) = tcp_stream.split();
 
     loop {
         let stdin_to_net = async {
-            let b = rx_input.next().await.ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "End of stdin input"))?;
-            tx_socket.write_all(&b).await?;
-            Ok(())
+            if let Some(b) = rx_input.next().await {
+                tx_socket.write_all(&b).await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         };
 
         let net_to_stdout = async {
-            let b = rx_socket.read_u8().await?;
-            stdout.write_all(&[b]).await?;
+            let mut b = [0u8];
+            let _ = rx_socket.read(&mut b).await?;
+            stdout.write_all(&b).await?;
             stdout.flush().await?;
             Ok(())
         };
 
         // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail
-        // out. It most likely means the socket was closed.
+        // out. It most likely means the socket was closed. Stdin ending is not an error.
         tokio::select! {
             result = stdin_to_net => {
-                if result.is_err() {
-                    return result;
+                // TODO can we use a macro here to remove duplication with udp?
+                match result {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        eprintln!("End of stdin reached.");
+                        return Ok(());
+                    },
+                    Err(_) => return result.and(Ok(())),
                 }
             },
             result = net_to_stdout => {
@@ -137,19 +159,7 @@ async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
     // can be done concurrently with reading/writing the TCP stream.
 
-    // TODO: eventually probably better to make this bounded
-    // TODO: could probably refactor this part into a helper
-    let (tx_input, mut rx_input) = mpsc::unbounded();
-    tokio::task::spawn(async move {
-        let mut stdin = std::io::stdin();
-        let mut read_buf = [0u8];
-        while let Ok(_) = stdin.read(&mut read_buf) {
-            if let Err(_) = tx_input.unbounded_send(read_buf) {
-                break;
-            }
-        }
-    });
-
+    let mut rx_input = setup_async_stdin_reader_thread();
     let mut stdout = tokio::io::stdout();
 
     // Make two references to the socket, one for the reader and one for the writer. This is a locked, reference counted
@@ -160,9 +170,12 @@ async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()
     loop {
         let stdin_to_net = async {
             // TODO: allow sending larger than 1 byte datagrams
-            let b = rx_input.next().await.ok_or(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "End of stdin input"))?;
-            tx_socket.send(&b).await?;
-            Ok(())
+            if let Some(b) = rx_input.next().await {
+                tx_socket.send(&b).await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         };
 
         let net_to_stdout = async {
@@ -188,8 +201,14 @@ async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()
         // out. It most likely means the socket was closed.
         tokio::select! {
             result = stdin_to_net => {
-                if result.is_err() {
-                    return result;
+                // TODO can we use a macro here to remove duplication with tcp?
+                match result {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        eprintln!("End of stdin reached.");
+                        return Ok(());
+                    },
+                    Err(_) => return result.and(Ok(())),
                 }
             },
             result = net_to_stdout => {
