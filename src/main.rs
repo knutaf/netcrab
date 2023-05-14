@@ -23,6 +23,11 @@ impl UdpTrafficSocket {
     }
 }
 
+enum StdinStatus {
+    StillOpen,
+    Closed,
+}
+
 // TODO: would be better if this were a task instead of a thread. or maybe use stream/sink
 fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
     // TODO: might be better to make this bounded eventually
@@ -44,6 +49,36 @@ fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
     }).expect("Failed to create stdin reader thread");
 
     rx_input
+}
+
+// Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail out. It
+// most likely means the socket was closed. Stdin ending is not an error.
+async fn service_stdio_and_net<F1, F2>(stdin_to_net : F1, net_to_stdout : F2) -> Option<std::io::Result<()>>
+where
+    F1 : futures::Future<Output = std::io::Result<StdinStatus>>,
+    F2 : futures::Future<Output = std::io::Result<()>> {
+    tokio::select! {
+        result = stdin_to_net => {
+            match result {
+                Ok(StdinStatus::StillOpen) => None,
+                Ok(StdinStatus::Closed) => {
+                    eprintln!("End of stdin reached.");
+                    Some(Ok(()))
+                },
+
+                // and() is needed to transform into this function's output result type
+                Err(_) => Some(result.and(Ok(()))),
+            }
+        },
+        result = net_to_stdout => {
+            if result.is_err() {
+                Some(result)
+            } else {
+                None
+            }
+        },
+        else => Some(Ok(())),
+    }
 }
 
 async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
@@ -170,9 +205,9 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::R
         let stdin_to_net = async {
             if let Some(b) = rx_input.next().await {
                 tx_socket.write_all(&b).await?;
-                Ok(true)
+                Ok(StdinStatus::StillOpen)
             } else {
-                Ok(false)
+                Ok(StdinStatus::Closed)
             }
         };
 
@@ -184,27 +219,10 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::R
             Ok(())
         };
 
-        // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail
-        // out. It most likely means the socket was closed. Stdin ending is not an error.
-        tokio::select! {
-            result = stdin_to_net => {
-                // TODO can we use a macro here to remove duplication with udp?
-                match result {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        eprintln!("End of stdin reached.");
-                        return Ok(());
-                    },
-                    Err(_) => return result.and(Ok(())),
-                }
-            },
-            result = net_to_stdout => {
-                if result.is_err() {
-                    return result;
-                }
-            },
-            else => return Ok(()),
-        };
+        match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
+            Some(res) => return res,
+            None => {},
+        }
     }
 }
 
@@ -285,13 +303,13 @@ async fn do_udp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_lis
             if let Some((tx_socket, peer_addr)) = target_peer {
                 if let Some(b) = rx_input.next().await {
                     tx_socket.send_to(&b, peer_addr).await?;
-                    Ok(true)
+                    Ok(StdinStatus::StillOpen)
                 } else {
-                    Ok(false)
+                    Ok(StdinStatus::Closed)
                 }
             } else {
                 // No incoming UDP traffic yet, so no idea where to send outbound packets.
-                Ok(true)
+                Ok(StdinStatus::StillOpen)
             }
         };
 
@@ -347,27 +365,10 @@ async fn do_udp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_lis
             }
         };
 
-        // TODO can this be refactored into a helper?
-        // Send stdin bytes to the network, and print out incoming bytes from the network. If any error occurs, bail
-        // out. It most likely means the socket was closed.
-        tokio::select! {
-            result = stdin_to_net => {
-                match result {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        eprintln!("End of stdin reached.");
-                        return Ok(());
-                    },
-                    Err(_) => return result.and(Ok(())),
-                }
-            },
-            result = net_to_stdout => {
-                if result.is_err() {
-                    return result;
-                }
-            },
-            else => return Ok(()),
-        };
+        match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
+            Some(res) => return res,
+            None => {},
+        }
     }
 }
 
@@ -387,9 +388,9 @@ async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::i
             // TODO: allow sending larger than 1 byte datagrams
             if let Some(b) = rx_input.next().await {
                 tx_socket.send(&b).await?;
-                Ok(true)
+                Ok(StdinStatus::StillOpen)
             } else {
-                Ok(false)
+                Ok(StdinStatus::Closed)
             }
         };
 
@@ -410,27 +411,10 @@ async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::i
             Ok(())
         };
 
-        // Send stdin bytes to the network, and print out incoming bytes from the network. If any error occurs, bail
-        // out. It most likely means the socket was closed.
-        tokio::select! {
-            result = stdin_to_net => {
-                // TODO can we use a macro here to remove duplication with tcp?
-                match result {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        eprintln!("End of stdin reached.");
-                        return Ok(());
-                    },
-                    Err(_) => return result.and(Ok(())),
-                }
-            },
-            result = net_to_stdout => {
-                if result.is_err() {
-                    return result;
-                }
-            },
-            else => return Ok(()),
-        };
+        match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
+            Some(res) => return res,
+            None => {},
+        }
     }
 }
 
