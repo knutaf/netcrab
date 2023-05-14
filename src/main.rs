@@ -5,6 +5,23 @@ use tokio::io::AsyncReadExt;
 use futures::StreamExt;
 use std::sync::Arc;
 use clap::Parser;
+use std::net::SocketAddr;
+
+// A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
+// of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
+struct UdpTrafficSocket {
+    socket : Arc<tokio::net::UdpSocket>,
+    recv_buf : [u8 ; 2000],
+}
+
+impl UdpTrafficSocket {
+    fn new(socket : tokio::net::UdpSocket) -> UdpTrafficSocket {
+        UdpTrafficSocket {
+            socket : Arc::new(socket),
+            recv_buf : [0 ; 2000], // arbitrary size, bigger than a 1500 byte datagram
+        }
+    }
+}
 
 // TODO: would be better if this were a task instead of a thread. or maybe use stream/sink
 fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
@@ -54,7 +71,7 @@ async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
     }
 }
 
-async fn tcp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+async fn tcp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
     eprintln!("Connecting to {}", addr);
 
     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
@@ -70,17 +87,22 @@ async fn tcp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Resul
     Ok(stream)
 }
 
-async fn do_tcp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_listening_repeatedly : bool) -> std::io::Result<()> {
+fn get_listen_addrs(listen_host_opt : Option<&str>, listen_port : u16) -> std::io::Result<Vec<SocketAddr>> {
     // If the caller specified a specific address, listen on that. Otherwise, listen on all the unspecified addresses.
-    let mut listen_addrs =
+    Ok(
         if let Some(listen_host) = listen_host_opt {
             vec![format!("{}:{}", listen_host, listen_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
         } else {
             vec![
-                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, listen_port)),
-                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, listen_port, 0, 0)),
+                SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, listen_port)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, listen_port, 0, 0)),
                 ]
-        };
+        }
+    )
+}
+
+async fn do_tcp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_listening_repeatedly : bool) -> std::io::Result<()> {
+    let mut listen_addrs = get_listen_addrs(listen_host_opt, listen_port)?;
 
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
@@ -186,6 +208,26 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::R
     }
 }
 
+async fn bind_udp_sockets(listen_host_opt : Option<&str>, listen_port : u16) -> std::io::Result<Vec<UdpTrafficSocket>> {
+    let mut listen_addrs = get_listen_addrs(listen_host_opt, listen_port)?;
+
+    // Map the listening addresses to a set of sockets, and bind them.
+    let mut listening_sockets = vec![];
+    for listen_addr in listen_addrs.drain(..) {
+        listening_sockets.push(UdpTrafficSocket::new(tokio::net::UdpSocket::bind(listen_addr).await?));
+
+        eprintln!("Bound UDP socket to {}, family {}",
+            listen_addr,
+            if listen_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+    }
+
+    if listening_sockets.len() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Could not bind any socket."));
+    }
+
+    Ok(listening_sockets)
+}
+
 async fn do_udp_connection(hostname : &str, port : u16) -> std::io::Result<()> {
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
@@ -194,27 +236,30 @@ async fn do_udp_connection(hostname : &str, port : u16) -> std::io::Result<()> {
     // choose not to indicate any response.
     for addr in candidates {
         let socket = udp_connect_to_candidate(addr).await?;
-        return handle_udp_socket(socket).await;
+        return handle_udp_outbound_connection(socket).await;
     }
 
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
 }
 
-async fn udp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
-    eprintln!("Connecting to {}", addr);
-
-    let socket = tokio::net::UdpSocket::bind(
+async fn udp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<UdpTrafficSocket> {
+    // Bind to a single socket that matches the address family of the target address.
+    let mut sockets = bind_udp_sockets(Some(
         if addr.is_ipv4() {
-            "0.0.0.0:0"
+            "0.0.0.0"
         } else {
-            "[::]:0"
-        }).await?;
+            "[::]"
+        }), 0).await?;
 
-    socket.connect(addr).await?;
+    assert!(sockets.len() == 1);
 
-    let local_addr = socket.local_addr()?;
-    let peer_addr = socket.peer_addr()?;
-    eprintln!("Connected from {} to {}, protocol UDP, family {}",
+    let socket = sockets.swap_remove(0);
+
+    socket.socket.connect(addr).await?;
+
+    let local_addr = socket.socket.local_addr()?;
+    let peer_addr = socket.socket.peer_addr()?;
+    eprintln!("Associating UDP socket from {} to {}, family {}",
         local_addr,
         peer_addr,
         if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
@@ -222,17 +267,120 @@ async fn udp_connect_to_candidate(addr : std::net::SocketAddr) -> std::io::Resul
     Ok(socket)
 }
 
-async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()> {
+async fn do_udp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_listening_repeatedly : bool) -> std::io::Result<()> {
+    let mut listeners = bind_udp_sockets(listen_host_opt, listen_port).await?;
+    let mut rx_input = setup_async_stdin_reader_thread();
+    let mut stdout = tokio::io::stdout();
+
+    // Track the list of known remote peers who have sent traffic to one of our listening sockets.
+    let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
+
+    // Track the target peer to use for send operations. Before any remote peer sends us traffic, it is none.
+    let mut next_target_peer : Option<(Arc<tokio::net::UdpSocket>, SocketAddr)> = None;
+
+    loop {
+        // Need to make a copy of it for use in this async operation, because it's set from from the recv path.
+        let target_peer = next_target_peer.clone();
+        let stdin_to_net = async {
+            if let Some((tx_socket, peer_addr)) = target_peer {
+                if let Some(b) = rx_input.next().await {
+                    tx_socket.send_to(&b, peer_addr).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                // No incoming UDP traffic yet, so no idea where to send outbound packets.
+                Ok(true)
+            }
+        };
+
+        let net_to_stdout = async {
+            // Listen for incoming UDP packets on all sockets at the same time. select_all waits for the first
+            // recv_from to complete and cancels waiting on all the rest.
+            let (listen_result, i, _) = futures::future::select_all(listeners.iter_mut().map(|listener| {
+                Box::pin(listener.socket.recv_from(&mut listener.recv_buf))
+            })).await;
+
+            match listen_result {
+                Ok((rx_bytes, peer_addr)) => {
+                    let recv_buf = listeners[i].recv_buf;
+
+                    // Set the destination peer address for stdin traffic to the first one we received data from.
+                    if next_target_peer.is_none() {
+                        next_target_peer = Some((listeners[i].socket.clone(), peer_addr.clone()));
+                    }
+
+                    // Only print out the first time receiving a datagram from a given peer.
+                    if known_peers.insert(peer_addr.clone()) {
+                        eprintln!("Received UDP datagram from {}, family {}",
+                            peer_addr,
+                            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+                    }
+
+                    // If the entire buffer filled up (which is bigger than a normal MTU) then whatever is happening is
+                    // unsupported.
+                    if rx_bytes == recv_buf.len() {
+                        eprintln!("Dropping datagram with unsupported size, larger than 2KB!");
+                        Ok(())
+                    } else {
+                        // Output only the amount of bytes received.
+                        stdout.write_all(&recv_buf[..rx_bytes]).await?;
+
+                        stdout.flush().await?;
+                        Ok(())
+                    }
+                },
+                Err(e) => {
+                    // Sometimes send failures show up in the receive path for some reason. If this happens, then
+                    // assume we got a failure from the currently selected target peer. Clear it so that it can be set
+                    // again on the next incoming datagram.
+                    next_target_peer = None;
+
+                    if !is_listening_repeatedly {
+                        Err(e)
+                    } else {
+                        eprintln!("Failed to receive UDP datagram: {}", e);
+                        Ok(())
+                    }
+                },
+            }
+        };
+
+        // TODO can this be refactored into a helper?
+        // Send stdin bytes to the network, and print out incoming bytes from the network. If any error occurs, bail
+        // out. It most likely means the socket was closed.
+        tokio::select! {
+            result = stdin_to_net => {
+                match result {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        eprintln!("End of stdin reached.");
+                        return Ok(());
+                    },
+                    Err(_) => return result.and(Ok(())),
+                }
+            },
+            result = net_to_stdout => {
+                if result.is_err() {
+                    return result;
+                }
+            },
+            else => return Ok(()),
+        };
+    }
+}
+
+async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::io::Result<()> {
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
     // can be done concurrently with reading/writing the TCP stream.
 
     let mut rx_input = setup_async_stdin_reader_thread();
     let mut stdout = tokio::io::stdout();
 
-    // Make two references to the socket, one for the reader and one for the writer. This is a locked, reference counted
-    // object, so both tasks can access it.
-    let rx_socket = Arc::new(socket);
-    let tx_socket = rx_socket.clone();
+    // Make a new reference to the socket for the writer. This is a locked, reference counted object, so both tasks can
+    // access it.
+    let tx_socket = socket.socket.clone();
 
     loop {
         let stdin_to_net = async {
@@ -247,18 +395,16 @@ async fn handle_udp_socket(socket : tokio::net::UdpSocket) -> std::io::Result<()
 
         let net_to_stdout = async {
             // Arbitrary sized buffer that's larger than a normal 1500 byte MTU.
-            let mut b = [0u8 ; 2048];
-
-            let rx_bytes = rx_socket.recv(&mut b).await?;
+            let rx_bytes = socket.socket.recv(&mut socket.recv_buf).await?;
 
             // If the entire buffer filled up (which is bigger than a normal MTU) then whatever is happening is
             // unsupported.
-            if rx_bytes == b.len() {
+            if rx_bytes == socket.recv_buf.len() {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Received datagram larger than 2KB."));
             }
 
             // Output only the amount of bytes received.
-            stdout.write_all(&b[..rx_bytes]).await?;
+            stdout.write_all(&socket.recv_buf[..rx_bytes]).await?;
 
             stdout.flush().await?;
             Ok(())
@@ -323,14 +469,18 @@ async fn main() -> Result<(), String> {
     }
 
     let result = if args.is_listening {
+        let listen_port = args.listen_port.ok_or(String::from("Need listening port"))?;
         if args.is_udp {
-            // TODO: implement UDP listener
-            Ok(())
+            do_udp_listen(
+                // TODO: support specifying the listen address
+                None,
+                listen_port,
+                args.is_listening_repeatedly).await
         } else {
             do_tcp_listen(
                 // TODO: support specifying the listen address
                 None,
-                args.listen_port.ok_or(String::from("Need listening port"))?,
+                listen_port,
                 args.is_listening_repeatedly).await
         }
     } else {
