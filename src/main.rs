@@ -4,8 +4,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::AsyncReadExt;
 use futures::StreamExt;
 use std::sync::Arc;
-use clap::Parser;
 use std::net::SocketAddr;
+use clap::Parser;
+use clap::CommandFactory;
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
 // of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
@@ -470,6 +471,13 @@ struct Args {
     port : Option<u16>,
 }
 
+fn usage(msg : &str) -> ! {
+    eprintln!("Error: {}", msg);
+    eprintln!();
+    let _ = Args::command().print_help();
+    std::process::exit(1)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut args = Args::parse();
@@ -489,7 +497,10 @@ async fn main() -> Result<(), String> {
     };
 
     let result = if args.is_listening {
-        source_port_opt.ok_or(String::from("Need listening port"))?;
+        if source_port_opt.is_none() {
+            usage("Need listening port");
+        }
+
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
@@ -498,8 +509,16 @@ async fn main() -> Result<(), String> {
             do_tcp_listen(&source_addrs, args.is_listening_repeatedly).await
         }
     } else {
-        let hostname = &args.hostname.ok_or(String::from("Need hostname to connect to"))?;
-        let port = args.port.ok_or(String::from("Need port to connect to"))?;
+        if args.hostname.is_none() {
+            usage("Need hostname to connect to");
+        }
+
+        if args.port.is_none() {
+            usage("Need port to connect to");
+        }
+
+        let hostname = &args.hostname.unwrap();
+        let port = args.port.unwrap();
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
