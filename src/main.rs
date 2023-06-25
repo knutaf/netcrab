@@ -28,10 +28,15 @@ enum StdinStatus {
     Closed,
 }
 
+fn format_io_err(err : std::io::Error) -> String {
+    format!("{}: {}", err.kind(), err)
+}
+
 // TODO: would be better if this were a task instead of a thread. or maybe use stream/sink
 fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
-    // TODO: might be better to make this bounded eventually
+    // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
+
     std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
         let mut stdin = std::io::stdin();
         let mut read_buf = [0u8];
@@ -81,14 +86,14 @@ where
     }
 }
 
-async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
+async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>) -> std::io::Result<()> {
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
     let mut candidate_count = 0;
     for addr in candidates {
         candidate_count += 1;
 
-        match tcp_connect_to_candidate(addr).await {
+        match tcp_connect_to_candidate(addr, source_addrs).await {
             Ok(tcp_stream) => {
                 // Return after first successful connection.
                 return handle_tcp_stream(tcp_stream).await;
@@ -106,10 +111,15 @@ async fn do_tcp_connect(hostname : &str, port : u16) -> std::io::Result<()> {
     }
 }
 
-async fn tcp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>) -> std::io::Result<tokio::net::TcpStream> {
     eprintln!("Connecting to {}", addr);
 
     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+
+    // Bind the local socket to the first local address that matches the address family of the destination.
+    let source_addr = source_addrs.iter().find(|e| { e.is_ipv4() == addr.is_ipv4() }).ok_or(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "No matching local address matched destination host's address family"))?;
+    socket.bind(*source_addr)?;
+
     let stream = socket.connect(addr).await?;
 
     let local_addr = stream.local_addr()?;
@@ -122,28 +132,29 @@ async fn tcp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<tokio::n
     Ok(stream)
 }
 
-fn get_listen_addrs(listen_host_opt : Option<&str>, listen_port : u16) -> std::io::Result<Vec<SocketAddr>> {
-    // If the caller specified a specific address, listen on that. Otherwise, listen on all the unspecified addresses.
+fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>) -> std::io::Result<Vec<SocketAddr>> {
+    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
+    let local_port = local_port_opt.unwrap_or(0);
+
+    // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
     Ok(
-        if let Some(listen_host) = listen_host_opt {
-            vec![format!("{}:{}", listen_host, listen_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
+        if let Some(local_host) = local_host_opt {
+            vec![format!("{}:{}", local_host, local_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
         } else {
             vec![
-                SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, listen_port)),
-                SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, listen_port, 0, 0)),
+                SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, local_port)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, local_port, 0, 0)),
                 ]
         }
     )
 }
 
-async fn do_tcp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_listening_repeatedly : bool) -> std::io::Result<()> {
-    let mut listen_addrs = get_listen_addrs(listen_host_opt, listen_port)?;
-
+async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly : bool) -> std::io::Result<()> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
-    for listen_addr in listen_addrs.drain(..) {
+    for listen_addr in listen_addrs {
         let listening_socket = if listen_addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
-        listening_socket.bind(listen_addr)?;
+        listening_socket.bind(*listen_addr)?;
         listening_sockets.push(listening_socket);
     }
 
@@ -226,13 +237,11 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::R
     }
 }
 
-async fn bind_udp_sockets(listen_host_opt : Option<&str>, listen_port : u16) -> std::io::Result<Vec<UdpTrafficSocket>> {
-    let mut listen_addrs = get_listen_addrs(listen_host_opt, listen_port)?;
-
+async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>) -> std::io::Result<Vec<UdpTrafficSocket>> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
-    for listen_addr in listen_addrs.drain(..) {
-        listening_sockets.push(UdpTrafficSocket::new(tokio::net::UdpSocket::bind(listen_addr).await?));
+    for listen_addr in listen_addrs {
+        listening_sockets.push(UdpTrafficSocket::new(tokio::net::UdpSocket::bind(*listen_addr).await?));
 
         eprintln!("Bound UDP socket to {}, family {}",
             listen_addr,
@@ -246,28 +255,41 @@ async fn bind_udp_sockets(listen_host_opt : Option<&str>, listen_port : u16) -> 
     Ok(listening_sockets)
 }
 
-async fn do_udp_connection(hostname : &str, port : u16) -> std::io::Result<()> {
+async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>) -> std::io::Result<()> {
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
     // Only use the first candidate. For UDP the concept of a "connection" is limited to being the implicit recipient of
     // a `send()` call. UDP also can't determine success, because the recipient might properly receive the packet but
     // choose not to indicate any response.
     for addr in candidates {
-        let socket = udp_connect_to_candidate(addr).await?;
+        let socket = udp_connect_to_candidate(addr, source_addrs).await?;
         return handle_udp_outbound_connection(socket).await;
     }
 
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
 }
 
-async fn udp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<UdpTrafficSocket> {
-    // Bind to a single socket that matches the address family of the target address.
-    let mut sockets = bind_udp_sockets(Some(
-        if addr.is_ipv4() {
-            "0.0.0.0"
+async fn udp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>) -> std::io::Result<UdpTrafficSocket> {
+
+    // Filter the source address list to at most one address of each family.
+    let mut did_find_ipv4 = false;
+    let mut did_find_ipv6 = false;
+    let source_addrs : Vec<SocketAddr> = source_addrs.iter().filter_map(|e| {
+        if e.is_ipv4() && !did_find_ipv4 {
+            did_find_ipv4 = true;
+            Some(*e)
+        } else if e.is_ipv6() && !did_find_ipv6 {
+            did_find_ipv6 = true;
+            Some(*e)
         } else {
-            "[::]"
-        }), 0).await?;
+            None
+        }
+    }).collect();
+
+    assert!(source_addrs.len() <= 2);
+
+    // Bind to a single socket that matches the address family of the target address.
+    let mut sockets = bind_udp_sockets(&source_addrs).await?;
 
     assert!(sockets.len() == 1);
 
@@ -285,8 +307,8 @@ async fn udp_connect_to_candidate(addr : SocketAddr) -> std::io::Result<UdpTraff
     Ok(socket)
 }
 
-async fn do_udp_listen(listen_host_opt : Option<&str>, listen_port : u16, is_listening_repeatedly : bool) -> std::io::Result<()> {
-    let mut listeners = bind_udp_sockets(listen_host_opt, listen_port).await?;
+async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly : bool) -> std::io::Result<()> {
+    let mut listeners = bind_udp_sockets(&listen_addrs).await?;
     let mut rx_input = setup_async_stdin_reader_thread();
     let mut stdout = tokio::io::stdout();
 
@@ -433,9 +455,13 @@ struct Args {
     #[arg(short = 'L')]
     is_listening_repeatedly : bool,
 
+    /// Source address to bind to
+    #[arg(short = 'S')]
+    source_host : Option<String>,
+
     /// Port to bind to
     #[arg(short = 'p')]
-    listen_port : Option<u16>,
+    source_port : Option<u16>,
 
     /// Hostname to connect to
     hostname : Option<String>,
@@ -452,31 +478,36 @@ async fn main() -> Result<(), String> {
         args.is_listening = true;
     }
 
+    // Converts Option<String> -> Option<&str>
+    let source_host_opt = args.source_host.as_deref();
+    let source_port_opt = args.source_port;
+
+    // Common code for getting the source addresses to use, but put into a closure to call it later, only after
+    // parameter validation is successful.
+    let make_source_addrs = || {
+        get_local_addrs(source_host_opt, source_port_opt).map_err(format_io_err)
+    };
+
     let result = if args.is_listening {
-        let listen_port = args.listen_port.ok_or(String::from("Need listening port"))?;
+        source_port_opt.ok_or(String::from("Need listening port"))?;
+        let source_addrs = make_source_addrs()?;
+
         if args.is_udp {
-            do_udp_listen(
-                // TODO: support specifying the listen address
-                None,
-                listen_port,
-                args.is_listening_repeatedly).await
+            do_udp_listen(&source_addrs, args.is_listening_repeatedly).await
         } else {
-            do_tcp_listen(
-                // TODO: support specifying the listen address
-                None,
-                listen_port,
-                args.is_listening_repeatedly).await
+            do_tcp_listen(&source_addrs, args.is_listening_repeatedly).await
         }
     } else {
         let hostname = &args.hostname.ok_or(String::from("Need hostname to connect to"))?;
         let port = args.port.ok_or(String::from("Need port to connect to"))?;
+        let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
-            do_udp_connection(hostname, port).await
+            do_udp_connection(hostname, port, &source_addrs).await
         } else {
-            do_tcp_connect(hostname, port).await
+            do_tcp_connect(hostname, port, &source_addrs).await
         }
     };
 
-    result.map_err(|e| { format!("{}: {}", e.kind(), e) })
+    result.map_err(format_io_err)
 }
