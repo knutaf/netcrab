@@ -487,7 +487,7 @@ struct NcArgs {
     is_listening_repeatedly : bool,
 
     /// Source address to bind to
-    #[arg(short = 'S')]
+    #[arg(short = 's')]
     source_host : Option<String>,
 
     /// Port to bind to
