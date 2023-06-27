@@ -142,11 +142,8 @@ async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketA
     Ok(stream)
 }
 
-fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
+fn get_local_addrs(local_host_opt : Option<&str>, local_port : u16, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
     assert!(!af_limit.use_v4 || !af_limit.use_v6);
-
-    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
-    let local_port = local_port_opt.unwrap_or(0);
 
     // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
     let mut addrs = if let Some(local_host) = local_host_opt {
@@ -490,9 +487,10 @@ struct NcArgs {
     #[arg(short = 's')]
     source_host : Option<String>,
 
+    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
     /// Port to bind to
-    #[arg(short = 'p')]
-    source_port : Option<u16>,
+    #[arg(short = 'p', default_value_t = 0)]
+    source_port : u16,
 
     /// Hostname to connect to
     hostname : Option<String>,
@@ -521,19 +519,14 @@ async fn main() -> Result<(), String> {
 
     // Converts Option<String> -> Option<&str>
     let source_host_opt = args.source_host.as_deref();
-    let source_port_opt = args.source_port;
 
     // Common code for getting the source addresses to use, but put into a closure to call it later, only after
     // parameter validation is successful.
     let make_source_addrs = || {
-        get_local_addrs(source_host_opt, source_port_opt, &args.af_limit).map_err(format_io_err)
+        get_local_addrs(source_host_opt, args.source_port, &args.af_limit).map_err(format_io_err)
     };
 
     let result = if args.is_listening {
-        if source_port_opt.is_none() {
-            usage("Need listening port");
-        }
-
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
