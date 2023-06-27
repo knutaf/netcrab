@@ -6,6 +6,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use clap::Parser;
+use clap::Args;
 use clap::CommandFactory;
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
@@ -87,11 +88,19 @@ where
     }
 }
 
-async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>) -> std::io::Result<()> {
+async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, af_limit : &AfLimit) -> std::io::Result<()> {
+    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
     let mut candidate_count = 0;
     for addr in candidates {
+        // Skip incompatible candidates from what address family the user specified.
+        if af_limit.use_v4 && addr.is_ipv6() ||
+           af_limit.use_v6 && addr.is_ipv4() {
+            continue;
+        }
+
         candidate_count += 1;
 
         match tcp_connect_to_candidate(addr, source_addrs).await {
@@ -133,21 +142,29 @@ async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketA
     Ok(stream)
 }
 
-fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>) -> std::io::Result<Vec<SocketAddr>> {
+fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
+    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+
     // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
     let local_port = local_port_opt.unwrap_or(0);
 
     // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
-    Ok(
-        if let Some(local_host) = local_host_opt {
-            vec![format!("{}:{}", local_host, local_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
-        } else {
-            vec![
-                SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, local_port)),
-                SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, local_port, 0, 0)),
-                ]
-        }
-    )
+    let mut addrs = if let Some(local_host) = local_host_opt {
+        vec![format!("{}:{}", local_host, local_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
+    } else {
+        vec![
+            SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, local_port)),
+            SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, local_port, 0, 0)),
+            ]
+    };
+
+    // If the caller specified only one address family, filter out any incompatible address families.
+    let addrs = addrs.drain(..).filter(|e| {
+        !(af_limit.use_v4 && e.is_ipv6() ||
+          af_limit.use_v6 && e.is_ipv4())
+    }).collect();
+
+    Ok(addrs)
 }
 
 async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly : bool) -> std::io::Result<()> {
@@ -256,13 +273,21 @@ async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>) -> std::io::Result<Ve
     Ok(listening_sockets)
 }
 
-async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>) -> std::io::Result<()> {
+async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, af_limit : &AfLimit) -> std::io::Result<()> {
+    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
     // Only use the first candidate. For UDP the concept of a "connection" is limited to being the implicit recipient of
     // a `send()` call. UDP also can't determine success, because the recipient might properly receive the packet but
     // choose not to indicate any response.
     for addr in candidates {
+        // Skip incompatible candidates from what address family the user specified.
+        if af_limit.use_v4 && addr.is_ipv6() ||
+           af_limit.use_v6 && addr.is_ipv4() {
+            continue;
+        }
+
         let socket = udp_connect_to_candidate(addr, source_addrs).await?;
         return handle_udp_outbound_connection(socket).await;
     }
@@ -272,26 +297,18 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
 
 async fn udp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>) -> std::io::Result<UdpTrafficSocket> {
 
-    // Filter the source address list to at most one address of each family.
-    let mut did_find_ipv4 = false;
-    let mut did_find_ipv6 = false;
+    // Filter the source address list to exactly one, which matches the address family of the destination.
     let source_addrs : Vec<SocketAddr> = source_addrs.iter().filter_map(|e| {
-        if e.is_ipv4() && !did_find_ipv4 {
-            did_find_ipv4 = true;
-            Some(*e)
-        } else if e.is_ipv6() && !did_find_ipv6 {
-            did_find_ipv6 = true;
+        if e.is_ipv4() == addr.is_ipv4() {
             Some(*e)
         } else {
             None
         }
-    }).collect();
-
-    assert!(source_addrs.len() <= 2);
+    }).take(1).collect();
+    assert!(source_addrs.len() == 1);
 
     // Bind to a single socket that matches the address family of the target address.
     let mut sockets = bind_udp_sockets(&source_addrs).await?;
-
     assert!(sockets.len() == 1);
 
     let socket = sockets.swap_remove(0);
@@ -441,9 +458,22 @@ async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::i
     }
 }
 
+
+#[derive(Args)]
+#[group(required = false, multiple = false)]
+struct AfLimit {
+    /// Use IPv4 only
+    #[arg(short = '4')]
+    use_v4 : bool,
+
+    /// Use IPv6 only
+    #[arg(short = '6')]
+    use_v6 : bool,
+}
+
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct NcArgs {
     /// Use UDP instead of TCP
     #[arg(short = 'u')]
     is_udp : bool,
@@ -469,18 +499,21 @@ struct Args {
 
     /// Port number to connect on
     port : Option<u16>,
+
+    #[command(flatten)]
+    af_limit: AfLimit,
 }
 
 fn usage(msg : &str) -> ! {
     eprintln!("Error: {}", msg);
     eprintln!();
-    let _ = Args::command().print_help();
+    let _ = NcArgs::command().print_help();
     std::process::exit(1)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let mut args = Args::parse();
+    let mut args = NcArgs::parse();
 
     if args.is_listening_repeatedly {
         args.is_listening = true;
@@ -493,7 +526,7 @@ async fn main() -> Result<(), String> {
     // Common code for getting the source addresses to use, but put into a closure to call it later, only after
     // parameter validation is successful.
     let make_source_addrs = || {
-        get_local_addrs(source_host_opt, source_port_opt).map_err(format_io_err)
+        get_local_addrs(source_host_opt, source_port_opt, &args.af_limit).map_err(format_io_err)
     };
 
     let result = if args.is_listening {
@@ -522,9 +555,9 @@ async fn main() -> Result<(), String> {
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
-            do_udp_connection(hostname, port, &source_addrs).await
+            do_udp_connection(hostname, port, &source_addrs, &args.af_limit).await
         } else {
-            do_tcp_connect(hostname, port, &source_addrs).await
+            do_tcp_connect(hostname, port, &source_addrs, &args.af_limit).await
         }
     };
 
