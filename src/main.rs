@@ -88,22 +88,22 @@ where
     }
 }
 
-async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, af_limit : &AfLimit) -> std::io::Result<()> {
-    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+    assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
     let mut candidate_count = 0;
     for addr in candidates {
         // Skip incompatible candidates from what address family the user specified.
-        if af_limit.use_v4 && addr.is_ipv6() ||
-           af_limit.use_v6 && addr.is_ipv4() {
+        if args.af_limit.use_v4 && addr.is_ipv6() ||
+           args.af_limit.use_v6 && addr.is_ipv4() {
             continue;
         }
 
         candidate_count += 1;
 
-        match tcp_connect_to_candidate(addr, source_addrs).await {
+        match tcp_connect_to_candidate(addr, source_addrs, args.sendbuf_size).await {
             Ok(tcp_stream) => {
                 // Return after first successful connection.
                 return handle_tcp_stream(tcp_stream).await;
@@ -121,10 +121,12 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
     }
 }
 
-async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>) -> std::io::Result<tokio::net::TcpStream> {
+async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>, sendbuf_size : u32) -> std::io::Result<tokio::net::TcpStream> {
     eprintln!("Connecting to {}", addr);
 
     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+
+    socket.set_send_buffer_size(sendbuf_size)?;
 
     // Bind the local socket to the first local address that matches the address family of the destination.
     let source_addr = source_addrs.iter().find(|e| { e.is_ipv4() == addr.is_ipv4() }).ok_or(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "No matching local address matched destination host's address family"))?;
@@ -142,11 +144,8 @@ async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketA
     Ok(stream)
 }
 
-fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
+fn get_local_addrs(local_host_opt : Option<&str>, local_port : u16, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
     assert!(!af_limit.use_v4 || !af_limit.use_v6);
-
-    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
-    let local_port = local_port_opt.unwrap_or(0);
 
     // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
     let mut addrs = if let Some(local_host) = local_host_opt {
@@ -167,11 +166,12 @@ fn get_local_addrs(local_host_opt : Option<&str>, local_port_opt : Option<u16>, 
     Ok(addrs)
 }
 
-async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly : bool) -> std::io::Result<()> {
+async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
         let listening_socket = if listen_addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+        let _ = listening_socket.set_send_buffer_size(args.sendbuf_size);
         listening_socket.bind(*listen_addr)?;
         listening_sockets.push(listening_socket);
     }
@@ -202,7 +202,7 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly 
                 let stream_result = handle_tcp_stream(stream).await;
 
                 // After handling a client, either loop and accept another client or exit.
-                if !is_listening_repeatedly {
+                if !args.is_listening_repeatedly {
                     return stream_result;
                 } else {
                     match stream_result {
@@ -212,7 +212,7 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly 
                 }
             },
             Err(e) => {
-                if !is_listening_repeatedly {
+                if !args.is_listening_repeatedly {
                     return Err(e);
                 } else {
                     eprintln!("Failed to accept connection: {}", e);
@@ -273,8 +273,8 @@ async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>) -> std::io::Result<Ve
     Ok(listening_sockets)
 }
 
-async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, af_limit : &AfLimit) -> std::io::Result<()> {
-    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+    assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
@@ -283,13 +283,13 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
     // choose not to indicate any response.
     for addr in candidates {
         // Skip incompatible candidates from what address family the user specified.
-        if af_limit.use_v4 && addr.is_ipv6() ||
-           af_limit.use_v6 && addr.is_ipv4() {
+        if args.af_limit.use_v4 && addr.is_ipv6() ||
+           args.af_limit.use_v6 && addr.is_ipv4() {
             continue;
         }
 
         let socket = udp_connect_to_candidate(addr, source_addrs).await?;
-        return handle_udp_outbound_connection(socket).await;
+        return handle_udp_outbound_connection(socket, args.sendbuf_size).await;
     }
 
     Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
@@ -325,9 +325,12 @@ async fn udp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketA
     Ok(socket)
 }
 
-async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly : bool) -> std::io::Result<()> {
+async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
     let mut listeners = bind_udp_sockets(&listen_addrs).await?;
-    let mut rx_input = setup_async_stdin_reader_thread();
+
+    // Pull out chunks of the specified datagram size to make full datagrams to send.
+    let mut rx_chunks = setup_async_stdin_reader_thread().map(|b| b[0]).chunks(args.sendbuf_size as usize);
+
     let mut stdout = tokio::io::stdout();
 
     // Track the list of known remote peers who have sent traffic to one of our listening sockets.
@@ -341,7 +344,7 @@ async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly 
         let target_peer = next_target_peer.clone();
         let stdin_to_net = async {
             if let Some((tx_socket, peer_addr)) = target_peer {
-                if let Some(b) = rx_input.next().await {
+                if let Some(b) = rx_chunks.next().await {
                     tx_socket.send_to(&b, peer_addr).await?;
                     Ok(StdinStatus::StillOpen)
                 } else {
@@ -395,7 +398,7 @@ async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly 
                     // again on the next incoming datagram.
                     next_target_peer = None;
 
-                    if !is_listening_repeatedly {
+                    if !args.is_listening_repeatedly {
                         Err(e)
                     } else {
                         eprintln!("Failed to receive UDP datagram: {}", e);
@@ -412,11 +415,12 @@ async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, is_listening_repeatedly 
     }
 }
 
-async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::io::Result<()> {
+async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket, datagram_size : u32) -> std::io::Result<()> {
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
-    // can be done concurrently with reading/writing the TCP stream.
+    // can be done concurrently with reading/writing the UDP datagrams.
+    // Pull out chunks of the specified datagram size to make full datagrams to send.
+    let mut rx_chunks = setup_async_stdin_reader_thread().map(|b| b[0]).chunks(datagram_size as usize);
 
-    let mut rx_input = setup_async_stdin_reader_thread();
     let mut stdout = tokio::io::stdout();
 
     // Make a new reference to the socket for the writer. This is a locked, reference counted object, so both tasks can
@@ -425,8 +429,7 @@ async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket) -> std::i
 
     loop {
         let stdin_to_net = async {
-            // TODO: allow sending larger than 1 byte datagrams
-            if let Some(b) = rx_input.next().await {
+            if let Some(b) = rx_chunks.next().await {
                 tx_socket.send(&b).await?;
                 Ok(StdinStatus::StillOpen)
             } else {
@@ -490,9 +493,14 @@ struct NcArgs {
     #[arg(short = 's')]
     source_host : Option<String>,
 
+    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
     /// Port to bind to
-    #[arg(short = 'p')]
-    source_port : Option<u16>,
+    #[arg(short = 'p', default_value_t = 0)]
+    source_port : u16,
+
+    /// Send buffer/datagram size
+    #[arg(long = "sb", default_value_t = 1)]
+    sendbuf_size : u32,
 
     /// Hostname to connect to
     hostname : Option<String>,
@@ -521,25 +529,20 @@ async fn main() -> Result<(), String> {
 
     // Converts Option<String> -> Option<&str>
     let source_host_opt = args.source_host.as_deref();
-    let source_port_opt = args.source_port;
 
     // Common code for getting the source addresses to use, but put into a closure to call it later, only after
     // parameter validation is successful.
     let make_source_addrs = || {
-        get_local_addrs(source_host_opt, source_port_opt, &args.af_limit).map_err(format_io_err)
+        get_local_addrs(source_host_opt, args.source_port, &args.af_limit).map_err(format_io_err)
     };
 
     let result = if args.is_listening {
-        if source_port_opt.is_none() {
-            usage("Need listening port");
-        }
-
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
-            do_udp_listen(&source_addrs, args.is_listening_repeatedly).await
+            do_udp_listen(&source_addrs, &args).await
         } else {
-            do_tcp_listen(&source_addrs, args.is_listening_repeatedly).await
+            do_tcp_listen(&source_addrs, &args).await
         }
     } else {
         if args.hostname.is_none() {
@@ -550,14 +553,14 @@ async fn main() -> Result<(), String> {
             usage("Need port to connect to");
         }
 
-        let hostname = &args.hostname.unwrap();
+        let hostname = args.hostname.as_ref().unwrap();
         let port = args.port.unwrap();
         let source_addrs = make_source_addrs()?;
 
         if args.is_udp {
-            do_udp_connection(hostname, port, &source_addrs, &args.af_limit).await
+            do_udp_connection(hostname, port, &source_addrs, &args).await
         } else {
-            do_tcp_connect(hostname, port, &source_addrs, &args.af_limit).await
+            do_tcp_connect(hostname, port, &source_addrs, &args).await
         }
     };
 
