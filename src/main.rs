@@ -132,8 +132,12 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
 
         match tcp_connect_to_candidate(addr, source_addrs, args.sendbuf_size).await {
             Ok(tcp_stream) => {
-                // Return after first successful connection.
-                return handle_tcp_stream(tcp_stream).await;
+                if args.is_zero_io {
+                    return Ok(());
+                } else {
+                    // Return after first successful connection.
+                    return handle_tcp_stream(tcp_stream).await;
+                }
             },
             Err(e) => {
                 eprintln!("Failed to connect to {}. Error: {}", addr, e);
@@ -226,7 +230,13 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
                 eprintln!("Accepted connection from {}, protocol TCP, family {}",
                     peer_addr,
                     if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
-                let stream_result = handle_tcp_stream(stream).await;
+
+                // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
+                let stream_result = if args.is_zero_io {
+                    Ok(())
+                } else {
+                    handle_tcp_stream(stream).await
+                };
 
                 // After handling a client, either loop and accept another client or exit.
                 if !args.is_listening_repeatedly {
@@ -532,6 +542,10 @@ struct NcArgs {
     #[arg(long = "sb", default_value_t = 1)]
     sendbuf_size : u32,
 
+    /// Zero-IO mode. Only test for connection. (TCP only)
+    #[arg(short = 'z')]
+    is_zero_io : bool,
+
     /// Hostname to connect to
     hostname : Option<String>,
 
@@ -555,6 +569,11 @@ async fn main() -> Result<(), String> {
 
     if args.is_listening_repeatedly {
         args.is_listening = true;
+    }
+
+    if args.is_zero_io && args.is_udp {
+        eprintln!("Warning: Zero-IO mode has no effect outside of TCP.");
+        args.is_zero_io = false;
     }
 
     // Converts Option<String> -> Option<&str>
