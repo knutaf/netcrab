@@ -1,10 +1,14 @@
-use std::io::Read;
-use futures::channel::mpsc;
-use tokio::io::AsyncWriteExt;
-use tokio::io::AsyncReadExt;
-use futures::StreamExt;
 use std::sync::Arc;
+use std::io::Read;
+use futures::future;
+use futures::channel::mpsc;
 use std::net::SocketAddr;
+use tokio::io::AsyncWriteExt;
+use futures::StreamExt;
+use futures::SinkExt;
+use tokio_util::codec::FramedRead;
+use tokio_util::codec::FramedWrite;
+use tokio_util::codec::BytesCodec;
 use clap::Parser;
 use clap::Args;
 use clap::CommandFactory;
@@ -34,23 +38,46 @@ fn format_io_err(err : std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
-// TODO: would be better if this were a task instead of a thread. or maybe use stream/sink
-fn setup_async_stdin_reader_thread() -> mpsc::UnboundedReceiver<[u8 ; 1]> {
+// Tokio's async Stdin implementation doesn't work well for interactive uses. Ituses a blocking read, so if we notice
+// the socket (not stdin) close, we can't cancel the read on stdin. The user has to hit enter to make the read call
+// finish, and then the next read won't be started.
+//
+// This isn't very nice for interactive uses. Instead, this thread uses a separate thread for the blocking stdin read.
+// If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
+fn setup_async_stdin_reader_thread(chunk_size : u32) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
     std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
         let mut stdin = std::io::stdin();
-        let mut read_buf = [0u8];
-        while let Ok(num_bytes_read) = stdin.read(&mut read_buf) {
+
+        // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size. It
+        // will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed for the
+        // next chunk.
+        let mut read_buf = vec![0u8 ; chunk_size as usize];
+        let mut available_buf = &mut read_buf[..];
+
+        while let Ok(num_bytes_read) = stdin.read(available_buf) {
             if num_bytes_read == 0 {
                 // EOF. Disconnect from the channel too.
                 tx_input.disconnect();
                 break;
             }
 
-            if let Err(_) = tx_input.unbounded_send(read_buf) {
-                break;
+            assert!(num_bytes_read <= available_buf.len());
+
+            // We've accumulated a full chunk, so send it now.
+            if num_bytes_read == available_buf.len() {
+                if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
+                    break;
+                }
+
+                // The chunk was sent. Reset the buffer to allow storing the net chunk.
+                available_buf = &mut read_buf[..];
+            } else {
+                // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the portion
+                // that was written to.
+                available_buf = &mut available_buf[num_bytes_read..];
             }
         }
     }).expect("Failed to create stdin reader thread");
@@ -223,35 +250,37 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
 }
 
 async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::Result<()> {
+    let (rx_socket, tx_socket) = tcp_stream.split();
+
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
     // can be done concurrently with reading/writing the TCP stream.
+    let mut stdin = setup_async_stdin_reader_thread(1);
+    let mut stdin_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
 
-    let mut rx_input = setup_async_stdin_reader_thread();
-    let mut stdout = tokio::io::stdout();
-    let (mut rx_socket, mut tx_socket) = tcp_stream.split();
+    let mut stdout = FramedWrite::new(tokio::io::stdout(), BytesCodec::new());
 
-    loop {
-        let stdin_to_net = async {
-            if let Some(b) = rx_input.next().await {
-                tx_socket.write_all(&b).await?;
-                Ok(StdinStatus::StillOpen)
-            } else {
-                Ok(StdinStatus::Closed)
-            }
-        };
+    // Filter map Result<BytesMut, Error> stream into just a Bytes stream to match stdout Sink. On Error, log the error
+    // and end the stream.
+    let mut rx_net_stream = FramedRead::new(rx_socket, BytesCodec::new())
+        .filter_map(|bm| match bm {
+            //BytesMut into Bytes
+            Ok(bm) => future::ready(Some(bm.freeze())),
+            Err(e) => {
+                eprintln!("failed to read from socket; error={}", e);
+                future::ready(None)
+            },
+        })
+        .map(Ok);
 
-        let net_to_stdout = async {
-            let mut b = [0u8];
-            let _ = rx_socket.read(&mut b).await?;
-            stdout.write_all(&b).await?;
-            stdout.flush().await?;
-            Ok(())
-        };
-
-        match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
-            Some(res) => return res,
-            None => {},
-        }
+    // End when either the socket is closed or stdin/stdout is closed.
+    tokio::select! {
+        result = stdin_to_net_sink.send_all(&mut stdin) => {
+            eprintln!("End of stdin reached.");
+            result
+        },
+        result = stdout.send_all(&mut rx_net_stream) => {
+            result
+        },
     }
 }
 
@@ -328,8 +357,8 @@ async fn udp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketA
 async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
     let mut listeners = bind_udp_sockets(&listen_addrs).await?;
 
-    // Pull out chunks of the specified datagram size to make full datagrams to send.
-    let mut rx_chunks = setup_async_stdin_reader_thread().map(|b| b[0]).chunks(args.sendbuf_size as usize);
+    // Set up a thread to read from stdin. It will produce only chunks of the required datagram size to send.
+    let mut stdin = setup_async_stdin_reader_thread(args.sendbuf_size);
 
     let mut stdout = tokio::io::stdout();
 
@@ -344,7 +373,8 @@ async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
         let target_peer = next_target_peer.clone();
         let stdin_to_net = async {
             if let Some((tx_socket, peer_addr)) = target_peer {
-                if let Some(b) = rx_chunks.next().await {
+                if let Some(Ok(b)) = stdin.next().await {
+                    assert!(b.len() == args.sendbuf_size as usize);
                     tx_socket.send_to(&b, peer_addr).await?;
                     Ok(StdinStatus::StillOpen)
                 } else {
@@ -417,9 +447,8 @@ async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
 
 async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket, datagram_size : u32) -> std::io::Result<()> {
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
-    // can be done concurrently with reading/writing the UDP datagrams.
-    // Pull out chunks of the specified datagram size to make full datagrams to send.
-    let mut rx_chunks = setup_async_stdin_reader_thread().map(|b| b[0]).chunks(datagram_size as usize);
+    // can be done concurrently with reading/writing the UDP datagrams. Ask for only chunks that are datagram size.
+    let mut stdin = setup_async_stdin_reader_thread(datagram_size);
 
     let mut stdout = tokio::io::stdout();
 
@@ -429,8 +458,9 @@ async fn handle_udp_outbound_connection(mut socket : UdpTrafficSocket, datagram_
 
     loop {
         let stdin_to_net = async {
-            if let Some(b) = rx_chunks.next().await {
-                tx_socket.send(&b).await?;
+            if let Some(Ok(buf)) = stdin.next().await {
+                assert!(buf.len() == datagram_size as usize);
+                tx_socket.send(&buf).await?;
                 Ok(StdinStatus::StillOpen)
             } else {
                 Ok(StdinStatus::Closed)
