@@ -12,4 +12,5 @@ tokio-util = { version = "0.7.0", features = ["full"] }
 tokio-stream = { version = "0.1" }
 bytes = "1.0.0"
 clap = { version = "4.2.2", features = ["derive"] }
+console = "0.15.7"
 

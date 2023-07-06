@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::io::Read;
+use std::io::Write;
+use std::io::IsTerminal;
 use futures::future;
 use futures::channel::mpsc;
 use std::net::SocketAddr;
@@ -44,40 +46,103 @@ fn format_io_err(err : std::io::Error) -> String {
 //
 // This isn't very nice for interactive uses. Instead, this thread uses a separate thread for the blocking stdin read.
 // If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
-fn setup_async_stdin_reader_thread(chunk_size : u32) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
+fn setup_async_stdin_reader_thread(chunk_size : u32, should_disable_console_char_mode : bool) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
-    std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
-        let mut stdin = std::io::stdin();
+    // If the user is interactively using the program, by default use "character mode", which inputs a character on
+    // on every keystroke rather than a full line when hitting enter. However, the user can request to use normal
+    // stdin mode.
+    let is_char_mode = std::io::stdin().is_terminal() && !should_disable_console_char_mode;
 
+    std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
         // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size. It
         // will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed for the
         // next chunk.
         let mut read_buf = vec![0u8 ; chunk_size as usize];
+
+        // The available buffer (pointer to next byte to write and remaining available space in the chunk).
         let mut available_buf = &mut read_buf[..];
 
-        while let Ok(num_bytes_read) = stdin.read(available_buf) {
-            if num_bytes_read == 0 {
-                // EOF. Disconnect from the channel too.
-                tx_input.disconnect();
-                break;
+        if is_char_mode {
+            // The console crate has a function called stdout that gives you a Term object that also services input. OK.
+            let mut stdio = console::Term::stdout();
+
+            // A buffer specifically for encoding a single `char` read by the console crate.
+            let mut char_buf = [0u8 ; std::mem::size_of::<char>()];
+            let char_buf_len = char_buf.len();
+
+            while let Ok(ch) = stdio.read_char() {
+                // Encode the char from input as a series of bytes.
+                let encoded_str = ch.encode_utf8(&mut char_buf);
+                let num_bytes_read = encoded_str.len();
+                assert!(num_bytes_read <= char_buf_len);
+
+                // Echo the char back out, because `read_char` doesn't.
+                let _ = stdio.write(encoded_str.as_bytes());
+
+                // Track a slice of the remaining bytes of the just-read char that haven't been sent yet.
+                let mut char_bytes_remaining = &mut char_buf[.. num_bytes_read];
+                while char_bytes_remaining.len() > 0 {
+                    // There might not be enough space left in the chunk to fit the whole char.
+                    let num_bytes_copyable = std::cmp::min(available_buf.len(), char_bytes_remaining.len());
+                    assert!(num_bytes_copyable <= available_buf.len());
+                    assert!(num_bytes_copyable <= char_bytes_remaining.len());
+                    assert!(num_bytes_copyable > 0);
+
+                    // Copy as much of the char as possible into the chunk. Note that for UTF-8 characters sent in UDP
+                    // datagrams, if we fail to copy the whole character into a given datagram, the resultant traffic
+                    // might be... strange. Imagine having a UTF-8 character split across two datagrams. Not great, but
+                    // also not lossy, so who is to say what is correct? It's not possible to fully fill every UDP
+                    // datagram of arbitrary size with varying size UTF-8 characters and not sometimes slice them.
+                    available_buf[.. num_bytes_copyable].copy_from_slice(&char_bytes_remaining[.. num_bytes_copyable]);
+
+                    // Update the available buffer to the remaining space in the chunk after copying in this char.
+                    available_buf = &mut available_buf[num_bytes_copyable ..];
+
+                    // Advance the remaining slice of the char to the uncopied portion.
+                    char_bytes_remaining = &mut char_bytes_remaining[num_bytes_copyable ..];
+
+                    // There's no more available buffer in this chunk, meaning we've accumulated a full chunk, so send
+                    // it now.
+                    if available_buf.len() == 0 {
+                        // Stop borrowing read_buf for a hot second so it can be sent.
+                        available_buf = &mut[];
+
+                        if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
+                            break;
+                        }
+
+                        // The chunk was sent. Reset the available buffer to allow storing the net chunk.
+                        available_buf = &mut read_buf[..];
+                    }
+                }
             }
+        } else {
+            let mut stdin = std::io::stdin();
 
-            assert!(num_bytes_read <= available_buf.len());
-
-            // We've accumulated a full chunk, so send it now.
-            if num_bytes_read == available_buf.len() {
-                if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
+            while let Ok(num_bytes_read) = stdin.read(available_buf) {
+                if num_bytes_read == 0 {
+                    // EOF. Disconnect from the channel too.
+                    tx_input.disconnect();
                     break;
                 }
 
-                // The chunk was sent. Reset the buffer to allow storing the net chunk.
-                available_buf = &mut read_buf[..];
-            } else {
-                // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the portion
-                // that was written to.
-                available_buf = &mut available_buf[num_bytes_read..];
+                assert!(num_bytes_read <= available_buf.len());
+
+                // We've accumulated a full chunk, so send it now.
+                if num_bytes_read == available_buf.len() {
+                    if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
+                        break;
+                    }
+
+                    // The chunk was sent. Reset the buffer to allow storing the net chunk.
+                    available_buf = &mut read_buf[..];
+                } else {
+                    // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
+                    // portion that was written to.
+                    available_buf = &mut available_buf[num_bytes_read ..];
+                }
             }
         }
     }).expect("Failed to create stdin reader thread");
@@ -136,7 +201,7 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
                     return Ok(());
                 } else {
                     // Return after first successful connection.
-                    return handle_tcp_stream(tcp_stream).await;
+                    return handle_tcp_stream(tcp_stream, args.should_disable_console_char_mode).await;
                 }
             },
             Err(e) => {
@@ -235,7 +300,7 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
                 let stream_result = if args.is_zero_io {
                     Ok(())
                 } else {
-                    handle_tcp_stream(stream).await
+                    handle_tcp_stream(stream, args.should_disable_console_char_mode).await
                 };
 
                 // After handling a client, either loop and accept another client or exit.
@@ -259,12 +324,12 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
     }
 }
 
-async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream) -> std::io::Result<()> {
+async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream, should_disable_console_char_mode : bool) -> std::io::Result<()> {
     let (rx_socket, tx_socket) = tcp_stream.split();
 
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
     // can be done concurrently with reading/writing the TCP stream.
-    let mut stdin = setup_async_stdin_reader_thread(1);
+    let mut stdin = setup_async_stdin_reader_thread(1, should_disable_console_char_mode);
     let mut stdin_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
 
     let mut stdout = FramedWrite::new(tokio::io::stdout(), BytesCodec::new());
@@ -364,7 +429,7 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
     }
 
     // Set up a thread to read from stdin. It will produce only chunks of the required datagram size to send.
-    let mut stdin = setup_async_stdin_reader_thread(args.sendbuf_size);
+    let mut stdin = setup_async_stdin_reader_thread(args.sendbuf_size, args.should_disable_console_char_mode);
 
     let mut stdout = tokio::io::stdout();
 
@@ -428,7 +493,7 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
                         Ok(())
                     } else {
                         // Output only the amount of bytes received.
-                        stdout.write_all(&recv_buf[..rx_bytes]).await?;
+                        stdout.write_all(&recv_buf[.. rx_bytes]).await?;
 
                         stdout.flush().await?;
                         Ok(())
@@ -505,6 +570,10 @@ struct NcArgs {
     /// Send broadcast data (outgoing UDP only)
     #[arg(short = 'b', requires = "is_udp", conflicts_with = "is_listening", conflicts_with = "is_listening_repeatedly")]
     is_broadcast : bool,
+
+    /// Disable console character mode
+    #[arg(short = 'c')]
+    should_disable_console_char_mode : bool,
 
     /// Hostname to connect to
     hostname : Option<String>,
