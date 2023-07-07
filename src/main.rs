@@ -1,36 +1,29 @@
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
-use std::sync::Arc;
-use std::io::Read;
-use std::io::Write;
-use std::io::IsTerminal;
-use futures::future;
-use futures::channel::mpsc;
-use std::net::SocketAddr;
-use tokio::io::AsyncWriteExt;
-use futures::StreamExt;
-use futures::SinkExt;
-use tokio_util::codec::FramedRead;
-use tokio_util::codec::FramedWrite;
-use tokio_util::codec::BytesCodec;
-use clap::Parser;
-use clap::Args;
-use clap::CommandFactory;
+use clap::{Args, CommandFactory, Parser};
+use futures::{channel::mpsc, future, SinkExt, StreamExt};
 use sockconf::configure_socket_options;
+use std::{
+    io::{IsTerminal, Read, Write},
+    net::SocketAddr,
+    sync::Arc,
+};
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
 // of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
 struct UdpTrafficSocket {
-    socket : Arc<tokio::net::UdpSocket>,
-    recv_buf : [u8 ; 2000],
+    socket: Arc<tokio::net::UdpSocket>,
+    recv_buf: [u8; 2000],
 }
 
 impl UdpTrafficSocket {
-    fn new(socket : tokio::net::UdpSocket) -> UdpTrafficSocket {
+    fn new(socket: tokio::net::UdpSocket) -> UdpTrafficSocket {
         UdpTrafficSocket {
-            socket : Arc::new(socket),
-            recv_buf : [0 ; 2000], // arbitrary size, bigger than a 1500 byte datagram
+            socket: Arc::new(socket),
+            recv_buf: [0; 2000], // arbitrary size, bigger than a 1500 byte datagram
         }
     }
 }
@@ -40,126 +33,144 @@ enum StdinStatus {
     Closed,
 }
 
-fn format_io_err(err : std::io::Error) -> String {
+fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
-// Tokio's async Stdin implementation doesn't work well for interactive uses. Ituses a blocking read, so if we notice
+// Tokio's async Stdin implementation doesn't work well for interactive uses. It uses a blocking read, so if we notice
 // the socket (not stdin) close, we can't cancel the read on stdin. The user has to hit enter to make the read call
 // finish, and then the next read won't be started.
 //
 // This isn't very nice for interactive uses. Instead, this thread uses a separate thread for the blocking stdin read.
 // If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
-fn setup_async_stdin_reader_thread(chunk_size : u32, should_disable_console_char_mode : bool) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
+fn setup_async_stdin_reader_thread(
+    chunk_size: u32,
+    should_disable_console_char_mode: bool,
+) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
     // If the user is interactively using the program, by default use "character mode", which inputs a character on
-    // on every keystroke rather than a full line when hitting enter. However, the user can request to use normal
+    // every keystroke rather than a full line when hitting enter. However, the user can request to use normal
     // stdin mode.
     let is_char_mode = std::io::stdin().is_terminal() && !should_disable_console_char_mode;
 
-    std::thread::Builder::new().name("stdin_reader".to_string()).spawn(move || {
-        // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size. It
-        // will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed for the
-        // next chunk.
-        let mut read_buf = vec![0u8 ; chunk_size as usize];
+    std::thread::Builder::new()
+        .name("stdin_reader".to_string())
+        .spawn(move || {
+            // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size
+            // It will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed
+            // for the next chunk.
+            let mut read_buf = vec![0u8; chunk_size as usize];
 
-        // The available buffer (pointer to next byte to write and remaining available space in the chunk).
-        let mut available_buf = &mut read_buf[..];
+            // The available buffer (pointer to next byte to write and remaining available space in the chunk).
+            let mut available_buf = &mut read_buf[..];
 
-        if is_char_mode {
-            // The console crate has a function called stdout that gives you a Term object that also services input. OK.
-            let mut stdio = console::Term::stdout();
+            if is_char_mode {
+                // The console crate has a function called stdout that gives you, uh, a Term object that also services
+                // input. OK dude.
+                let mut stdio = console::Term::stdout();
 
-            // A buffer specifically for encoding a single `char` read by the console crate.
-            let mut char_buf = [0u8 ; std::mem::size_of::<char>()];
-            let char_buf_len = char_buf.len();
+                // A buffer specifically for encoding a single `char` read by the console crate.
+                let mut char_buf = [0u8; std::mem::size_of::<char>()];
+                let char_buf_len = char_buf.len();
 
-            while let Ok(ch) = stdio.read_char() {
-                // Encode the char from input as a series of bytes.
-                let encoded_str = ch.encode_utf8(&mut char_buf);
-                let num_bytes_read = encoded_str.len();
-                assert!(num_bytes_read <= char_buf_len);
+                while let Ok(ch) = stdio.read_char() {
+                    // Encode the char from input as a series of bytes.
+                    let encoded_str = ch.encode_utf8(&mut char_buf);
+                    let num_bytes_read = encoded_str.len();
+                    assert!(num_bytes_read <= char_buf_len);
 
-                // Echo the char back out, because `read_char` doesn't.
-                let _ = stdio.write(encoded_str.as_bytes());
+                    // Echo the char back out, because `read_char` doesn't.
+                    let _ = stdio.write(encoded_str.as_bytes());
 
-                // Track a slice of the remaining bytes of the just-read char that haven't been sent yet.
-                let mut char_bytes_remaining = &mut char_buf[.. num_bytes_read];
-                while char_bytes_remaining.len() > 0 {
-                    // There might not be enough space left in the chunk to fit the whole char.
-                    let num_bytes_copyable = std::cmp::min(available_buf.len(), char_bytes_remaining.len());
-                    assert!(num_bytes_copyable <= available_buf.len());
-                    assert!(num_bytes_copyable <= char_bytes_remaining.len());
-                    assert!(num_bytes_copyable > 0);
+                    // Track a slice of the remaining bytes of the just-read char that haven't been sent yet.
+                    let mut char_bytes_remaining = &mut char_buf[..num_bytes_read];
+                    while char_bytes_remaining.len() > 0 {
+                        // There might not be enough space left in the chunk to fit the whole char.
+                        let num_bytes_copyable =
+                            std::cmp::min(available_buf.len(), char_bytes_remaining.len());
+                        assert!(num_bytes_copyable <= available_buf.len());
+                        assert!(num_bytes_copyable <= char_bytes_remaining.len());
+                        assert!(num_bytes_copyable > 0);
 
-                    // Copy as much of the char as possible into the chunk. Note that for UTF-8 characters sent in UDP
-                    // datagrams, if we fail to copy the whole character into a given datagram, the resultant traffic
-                    // might be... strange. Imagine having a UTF-8 character split across two datagrams. Not great, but
-                    // also not lossy, so who is to say what is correct? It's not possible to fully fill every UDP
-                    // datagram of arbitrary size with varying size UTF-8 characters and not sometimes slice them.
-                    available_buf[.. num_bytes_copyable].copy_from_slice(&char_bytes_remaining[.. num_bytes_copyable]);
+                        // Copy as much of the char as possible into the chunk. Note that for UTF-8 characters sent in
+                        // UDP datagrams, if we fail to copy the whole character into a given datagram, the resultant
+                        // traffic might be... strange. Imagine having a UTF-8 character split across two datagrams.
+                        // Not great, but also not lossy, so who is to say what is correct? It's not possible to fully
+                        // fill every UDP datagram of arbitrary size with varying size UTF-8 characters and not
+                        // sometimes slice them.
+                        available_buf[..num_bytes_copyable]
+                            .copy_from_slice(&char_bytes_remaining[..num_bytes_copyable]);
 
-                    // Update the available buffer to the remaining space in the chunk after copying in this char.
-                    available_buf = &mut available_buf[num_bytes_copyable ..];
+                        // Update the available buffer to the remaining space in the chunk after copying in this char.
+                        available_buf = &mut available_buf[num_bytes_copyable..];
 
-                    // Advance the remaining slice of the char to the uncopied portion.
-                    char_bytes_remaining = &mut char_bytes_remaining[num_bytes_copyable ..];
+                        // Advance the remaining slice of the char to the uncopied portion.
+                        char_bytes_remaining = &mut char_bytes_remaining[num_bytes_copyable..];
 
-                    // There's no more available buffer in this chunk, meaning we've accumulated a full chunk, so send
-                    // it now.
-                    if available_buf.len() == 0 {
-                        // Stop borrowing read_buf for a hot second so it can be sent.
-                        available_buf = &mut[];
+                        // There's no more available buffer in this chunk, meaning we've accumulated a full chunk, so
+                        // send it now.
+                        if available_buf.len() == 0 {
+                            // Stop borrowing read_buf for a hot second so it can be sent.
+                            available_buf = &mut [];
 
-                        if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
-                            break;
+                            if let Err(_) = tx_input
+                                .unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf)))
+                            {
+                                break;
+                            }
+
+                            // The chunk was sent. Reset the available buffer to allow storing the net chunk.
+                            available_buf = &mut read_buf[..];
                         }
-
-                        // The chunk was sent. Reset the available buffer to allow storing the net chunk.
-                        available_buf = &mut read_buf[..];
                     }
                 }
-            }
-        } else {
-            let mut stdin = std::io::stdin();
+            } else {
+                let mut stdin = std::io::stdin();
 
-            while let Ok(num_bytes_read) = stdin.read(available_buf) {
-                if num_bytes_read == 0 {
-                    // EOF. Disconnect from the channel too.
-                    tx_input.disconnect();
-                    break;
-                }
-
-                assert!(num_bytes_read <= available_buf.len());
-
-                // We've accumulated a full chunk, so send it now.
-                if num_bytes_read == available_buf.len() {
-                    if let Err(_) = tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf))) {
+                while let Ok(num_bytes_read) = stdin.read(available_buf) {
+                    if num_bytes_read == 0 {
+                        // EOF. Disconnect from the channel too.
+                        tx_input.disconnect();
                         break;
                     }
 
-                    // The chunk was sent. Reset the buffer to allow storing the net chunk.
-                    available_buf = &mut read_buf[..];
-                } else {
-                    // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
-                    // portion that was written to.
-                    available_buf = &mut available_buf[num_bytes_read ..];
+                    assert!(num_bytes_read <= available_buf.len());
+
+                    // We've accumulated a full chunk, so send it now.
+                    if num_bytes_read == available_buf.len() {
+                        if let Err(_) =
+                            tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf)))
+                        {
+                            break;
+                        }
+
+                        // The chunk was sent. Reset the buffer to allow storing the net chunk.
+                        available_buf = &mut read_buf[..];
+                    } else {
+                        // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
+                        // portion that was written to.
+                        available_buf = &mut available_buf[num_bytes_read..];
+                    }
                 }
             }
-        }
-    }).expect("Failed to create stdin reader thread");
+        })
+        .expect("Failed to create stdin reader thread");
 
     rx_input
 }
 
 // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail out. It
 // most likely means the socket was closed. Stdin ending is not an error.
-async fn service_stdio_and_net<F1, F2>(stdin_to_net : F1, net_to_stdout : F2) -> Option<std::io::Result<()>>
+async fn service_stdio_and_net<F1, F2>(
+    stdin_to_net: F1,
+    net_to_stdout: F2,
+) -> Option<std::io::Result<()>>
 where
-    F1 : futures::Future<Output = std::io::Result<StdinStatus>>,
-    F2 : futures::Future<Output = std::io::Result<()>> {
+    F1: futures::Future<Output = std::io::Result<StdinStatus>>,
+    F2: futures::Future<Output = std::io::Result<()>>,
+{
     tokio::select! {
         result = stdin_to_net => {
             match result {
@@ -185,15 +196,15 @@ where
 }
 
 mod sockconf {
-    use std::mem::ManuallyDrop;
-    use crate::NcArgs;
     use crate::configure_socket2_options;
+    use crate::NcArgs;
+    use std::mem::ManuallyDrop;
 
     #[cfg(windows)]
-    use std::os::windows::io::{FromRawSocket, AsRawSocket};
+    use std::os::windows::io::{AsRawSocket, FromRawSocket};
 
     #[cfg(unix)]
-    use std::os::fd::{FromRawFd, AsRawFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     #[cfg(windows)]
     pub trait AsRawHandleType = AsRawSocket;
@@ -213,8 +224,14 @@ mod sockconf {
     // SAFETY:
     // - the socket is a valid open socket at the point of this call.
     // - the socket can be closed by closesocket - this doesn't apply, since we won't be closing it here.
-    pub fn configure_socket_options<S>(socket : &S, is_ipv4 : bool, args : &NcArgs) -> std::io::Result<()> 
-    where S : AsRawHandleType {
+    pub fn configure_socket_options<S>(
+        socket: &S,
+        is_ipv4: bool,
+        args: &NcArgs,
+    ) -> std::io::Result<()>
+    where
+        S: AsRawHandleType,
+    {
         let socket2 = ManuallyDrop::new(unsafe {
             #[cfg(windows)]
             let s = socket2::Socket::from_raw_socket(socket.as_raw_socket());
@@ -229,19 +246,23 @@ mod sockconf {
     }
 }
 
-fn configure_socket2_options(socket : &socket2::Socket, is_ipv4 : bool, args : &NcArgs) -> std::io::Result<()> {
+fn configure_socket2_options(
+    socket: &socket2::Socket,
+    is_ipv4: bool,
+    args: &NcArgs,
+) -> std::io::Result<()> {
     let socktype = socket.r#type()?;
 
     match socktype {
         socket2::Type::DGRAM => {
             socket.set_broadcast(args.is_broadcast)?;
-        },
+        }
         socket2::Type::STREAM => {
             // No stream-specific options for now
-        },
+        }
         _ => {
             eprintln!("Warning: unknown socket type {:?}", socktype);
-        },
+        }
     }
 
     socket.set_send_buffer_size(args.sendbuf_size as usize)?;
@@ -257,7 +278,12 @@ fn configure_socket2_options(socket : &socket2::Socket, is_ipv4 : bool, args : &
     Ok(())
 }
 
-async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+async fn do_tcp_connect(
+    hostname: &str,
+    port: u16,
+    source_addrs: &Vec<SocketAddr>,
+    args: &NcArgs,
+) -> std::io::Result<()> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
@@ -265,8 +291,7 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
     let mut candidate_count = 0;
     for addr in candidates {
         // Skip incompatible candidates from what address family the user specified.
-        if args.af_limit.use_v4 && addr.is_ipv6() ||
-           args.af_limit.use_v6 && addr.is_ipv4() {
+        if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
             continue;
         }
 
@@ -278,72 +303,113 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
                     return Ok(());
                 } else {
                     // Return after first successful connection.
-                    return handle_tcp_stream(tcp_stream, args.should_disable_console_char_mode).await;
+                    return handle_tcp_stream(tcp_stream, args.should_disable_console_char_mode)
+                        .await;
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("Failed to connect to {}. Error: {}", addr, e);
-            },
+            }
         }
     }
 
     if candidate_count == 0 {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Host not found.",
+        ))
     } else {
-        Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "Failed to connect to all candidates."))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "Failed to connect to all candidates.",
+        ))
     }
 }
 
-async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<tokio::net::TcpStream> {
+async fn tcp_connect_to_candidate(
+    addr: SocketAddr,
+    source_addrs: &Vec<SocketAddr>,
+    args: &NcArgs,
+) -> std::io::Result<tokio::net::TcpStream> {
     eprintln!("Connecting to {}", addr);
 
-    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }?;
 
     configure_socket_options(&socket, addr.is_ipv4(), args)?;
 
     // Bind the local socket to the first local address that matches the address family of the destination.
-    let source_addr = source_addrs.iter().find(|e| { e.is_ipv4() == addr.is_ipv4() }).ok_or(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "No matching local address matched destination host's address family"))?;
+    let source_addr = source_addrs
+        .iter()
+        .find(|e| e.is_ipv4() == addr.is_ipv4())
+        .ok_or(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "No matching local address matched destination host's address family",
+        ))?;
     socket.bind(*source_addr)?;
 
     let stream = socket.connect(addr).await?;
 
     let local_addr = stream.local_addr()?;
     let peer_addr = stream.peer_addr()?;
-    eprintln!("Connected from {} to {}, protocol TCP, family {}",
+    eprintln!(
+        "Connected from {} to {}, protocol TCP, family {}",
         local_addr,
         peer_addr,
-        if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+        if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+    );
 
     Ok(stream)
 }
 
-fn get_local_addrs(local_host_opt : Option<&str>, local_port : u16, af_limit : &AfLimit) -> std::io::Result<Vec<SocketAddr>> {
+fn get_local_addrs(
+    local_host_opt: Option<&str>,
+    local_port: u16,
+    af_limit: &AfLimit,
+) -> std::io::Result<Vec<SocketAddr>> {
     assert!(!af_limit.use_v4 || !af_limit.use_v6);
 
     // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
     let mut addrs = if let Some(local_host) = local_host_opt {
-        vec![format!("{}:{}", local_host, local_port).parse().or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
+        vec![format!("{}:{}", local_host, local_port)
+            .parse()
+            .or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?]
     } else {
         vec![
-            SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, local_port)),
-            SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, local_port, 0, 0)),
-            ]
+            SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                local_port,
+            )),
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::UNSPECIFIED,
+                local_port,
+                0,
+                0,
+            )),
+        ]
     };
 
     // If the caller specified only one address family, filter out any incompatible address families.
-    let addrs = addrs.drain(..).filter(|e| {
-        !(af_limit.use_v4 && e.is_ipv6() ||
-          af_limit.use_v6 && e.is_ipv4())
-    }).collect();
+    let addrs = addrs
+        .drain(..)
+        .filter(|e| !(af_limit.use_v4 && e.is_ipv6() || af_limit.use_v6 && e.is_ipv4()))
+        .collect();
 
     Ok(addrs)
 }
 
-async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io::Result<()> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
-        let listening_socket = if listen_addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
+        let listening_socket = if listen_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }?;
 
         configure_socket_options(&listening_socket, listen_addr.is_ipv4(), args)?;
         listening_socket.bind(*listen_addr)?;
@@ -354,9 +420,11 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
     let mut listeners = vec![];
     for listening_socket in listening_sockets {
         let local_addr = listening_socket.local_addr()?;
-        eprintln!("Listening on {}, protocol TCP, family {}",
+        eprintln!(
+            "Listening on {}, protocol TCP, family {}",
             local_addr,
-            if local_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+            if local_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+        );
 
         listeners.push(listening_socket.listen(1)?);
     }
@@ -364,15 +432,18 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
     loop {
         // Try to accept connections on any of the listening sockets. Handle clients one at a time. select_all waits for
         // the first accept to complete and cancels waiting on all the rest.
-        let (listen_result, _i, _rest) = futures::future::select_all(listeners.iter().map(|listener| {
-            Box::pin(listener.accept())
-        })).await;
+        let (listen_result, _i, _rest) = futures::future::select_all(
+            listeners.iter().map(|listener| Box::pin(listener.accept())),
+        )
+        .await;
 
         match listen_result {
             Ok((stream, ref peer_addr)) => {
-                eprintln!("Accepted connection from {}, protocol TCP, family {}",
+                eprintln!(
+                    "Accepted connection from {}, protocol TCP, family {}",
                     peer_addr,
-                    if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+                    if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+                );
 
                 // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
                 let stream_result = if args.is_zero_io {
@@ -387,22 +458,27 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
                 } else {
                     match stream_result {
                         Ok(_) => eprintln!("Connection from {} closed gracefully.", peer_addr),
-                        Err(e) => eprintln!("Connection from {} closed with result: {}", peer_addr, e),
+                        Err(e) => {
+                            eprintln!("Connection from {} closed with result: {}", peer_addr, e)
+                        }
                     }
                 }
-            },
+            }
             Err(e) => {
                 if !args.is_listening_repeatedly {
                     return Err(e);
                 } else {
                     eprintln!("Failed to accept connection: {}", e);
                 }
-            },
+            }
         }
     }
 }
 
-async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream, should_disable_console_char_mode : bool) -> std::io::Result<()> {
+async fn handle_tcp_stream(
+    mut tcp_stream: tokio::net::TcpStream,
+    should_disable_console_char_mode: bool,
+) -> std::io::Result<()> {
     let (rx_socket, tx_socket) = tcp_stream.split();
 
     // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
@@ -421,7 +497,7 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream, should_disabl
             Err(e) => {
                 eprintln!("failed to read from socket; error={}", e);
                 future::ready(None)
-            },
+            }
         })
         .map(Ok);
 
@@ -437,7 +513,10 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream, should_disabl
     }
 }
 
-async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<Vec<UdpTrafficSocket>> {
+async fn bind_udp_sockets(
+    listen_addrs: &Vec<SocketAddr>,
+    args: &NcArgs,
+) -> std::io::Result<Vec<UdpTrafficSocket>> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
@@ -446,19 +525,33 @@ async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> st
 
         listening_sockets.push(UdpTrafficSocket::new(socket));
 
-        eprintln!("Bound UDP socket to {}, family {}",
+        eprintln!(
+            "Bound UDP socket to {}, family {}",
             listen_addr,
-            if listen_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+            if listen_addr.is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            }
+        );
     }
 
     if listening_sockets.len() == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Could not bind any socket."));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "Could not bind any socket.",
+        ));
     }
 
     Ok(listening_sockets)
 }
 
-async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+async fn do_udp_connection(
+    hostname: &str,
+    port: u16,
+    source_addrs: &Vec<SocketAddr>,
+    args: &NcArgs,
+) -> std::io::Result<()> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
@@ -468,19 +561,22 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
     // choose not to indicate any response.
     for addr in candidates {
         // Skip incompatible candidates from what address family the user specified.
-        if args.af_limit.use_v4 && addr.is_ipv6() ||
-           args.af_limit.use_v6 && addr.is_ipv4() {
+        if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
             continue;
         }
 
         // Filter the source address list to exactly one, which matches the address family of the destination.
-        let source_addrs : Vec<SocketAddr> = source_addrs.iter().filter_map(|e| {
-            if e.is_ipv4() == addr.is_ipv4() {
-                Some(*e)
-            } else {
-                None
-            }
-        }).take(1).collect();
+        let source_addrs: Vec<SocketAddr> = source_addrs
+            .iter()
+            .filter_map(|e| {
+                if e.is_ipv4() == addr.is_ipv4() {
+                    Some(*e)
+                } else {
+                    None
+                }
+            })
+            .take(1)
+            .collect();
         assert!(source_addrs.len() == 1);
 
         // Bind to a single socket that matches the address family of the target address.
@@ -490,25 +586,35 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
         return handle_udp_sockets(sockets, Some((0, addr)), args).await;
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Host not found."))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Host not found.",
+    ))
 }
 
-async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
+async fn do_udp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io::Result<()> {
     let listeners = bind_udp_sockets(&listen_addrs, args).await?;
     handle_udp_sockets(listeners, None, args).await
 }
 
-async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Option<(usize, SocketAddr)>, args : &NcArgs) -> std::io::Result<()> {
-    fn print_udp_assoc(socket : &tokio::net::UdpSocket, peer_addr : &SocketAddr) {
+async fn handle_udp_sockets(
+    mut sockets: Vec<UdpTrafficSocket>,
+    first_peer: Option<(usize, SocketAddr)>,
+    args: &NcArgs,
+) -> std::io::Result<()> {
+    fn print_udp_assoc(socket: &tokio::net::UdpSocket, peer_addr: &SocketAddr) {
         let local_addr = socket.local_addr().unwrap();
-        eprintln!("Associating UDP socket from {} to {}, family {}",
+        eprintln!(
+            "Associating UDP socket from {} to {}, family {}",
             local_addr,
             peer_addr,
-            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+        );
     }
 
     // Set up a thread to read from stdin. It will produce only chunks of the required datagram size to send.
-    let mut stdin = setup_async_stdin_reader_thread(args.sendbuf_size, args.should_disable_console_char_mode);
+    let mut stdin =
+        setup_async_stdin_reader_thread(args.sendbuf_size, args.should_disable_console_char_mode);
 
     let mut stdout = tokio::io::stdout();
 
@@ -516,10 +622,11 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
     let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
 
     // Track the target peer to use for send operations. The caller might pass in a first address as a target.
-    let mut next_target_peer : Option<(Arc<tokio::net::UdpSocket>, SocketAddr)> = first_peer.map(|(i, peer_addr)| {
-        print_udp_assoc(&sockets[i].socket, &peer_addr);
-        (sockets[i].socket.clone(), peer_addr)
-    });
+    let mut next_target_peer: Option<(Arc<tokio::net::UdpSocket>, SocketAddr)> =
+        first_peer.map(|(i, peer_addr)| {
+            print_udp_assoc(&sockets[i].socket, &peer_addr);
+            (sockets[i].socket.clone(), peer_addr)
+        });
 
     loop {
         // Need to make a copy of it for use in this async operation, because it's set from from the recv path.
@@ -544,9 +651,12 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
         let net_to_stdout = async {
             // Listen for incoming UDP packets on all sockets at the same time. select_all waits for the first
             // recv_from to complete and cancels waiting on all the rest.
-            let (listen_result, i, _) = futures::future::select_all(sockets.iter_mut().map(|listener| {
-                Box::pin(listener.socket.recv_from(&mut listener.recv_buf))
-            })).await;
+            let (listen_result, i, _) = futures::future::select_all(
+                sockets
+                    .iter_mut()
+                    .map(|listener| Box::pin(listener.socket.recv_from(&mut listener.recv_buf))),
+            )
+            .await;
 
             match listen_result {
                 Ok((rx_bytes, peer_addr)) => {
@@ -560,9 +670,11 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
 
                     // Only print out the first time receiving a datagram from a given peer.
                     if known_peers.insert(peer_addr.clone()) {
-                        eprintln!("Received UDP datagram from {}, family {}",
+                        eprintln!(
+                            "Received UDP datagram from {}, family {}",
                             peer_addr,
-                            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" });
+                            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+                        );
                     }
 
                     // If the entire buffer filled up (which is bigger than a normal MTU) then whatever is happening is
@@ -572,12 +684,12 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
                         Ok(())
                     } else {
                         // Output only the amount of bytes received.
-                        stdout.write_all(&recv_buf[.. rx_bytes]).await?;
+                        stdout.write_all(&recv_buf[..rx_bytes]).await?;
 
                         stdout.flush().await?;
                         Ok(())
                     }
-                },
+                }
                 Err(e) => {
                     // Sometimes send failures show up in the receive path for some reason. If this happens, then
                     // assume we got a failure from the currently selected target peer. Clear it so that it can be set
@@ -590,28 +702,27 @@ async fn handle_udp_sockets(mut sockets : Vec<UdpTrafficSocket>, first_peer : Op
                         eprintln!("Failed to receive UDP datagram: {}", e);
                         Ok(())
                     }
-                },
+                }
             }
         };
 
         match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
             Some(res) => return res,
-            None => {},
+            None => {}
         }
     }
 }
-
 
 #[derive(Args)]
 #[group(required = false, multiple = false)]
 struct AfLimit {
     /// Use IPv4 only
     #[arg(short = '4')]
-    use_v4 : bool,
+    use_v4: bool,
 
     /// Use IPv6 only
     #[arg(short = '6')]
-    use_v6 : bool,
+    use_v6: bool,
 }
 
 #[derive(clap::Parser)]
@@ -619,56 +730,58 @@ struct AfLimit {
 pub struct NcArgs {
     /// Use UDP instead of TCP
     #[arg(short = 'u')]
-    is_udp : bool,
+    is_udp: bool,
 
     /// Listen for incoming connections
     #[arg(short = 'l')]
-    is_listening : bool,
+    is_listening: bool,
 
     /// Listen repeatedly for incoming connections (implies -l)
     #[arg(short = 'L')]
-    is_listening_repeatedly : bool,
+    is_listening_repeatedly: bool,
 
     /// Source address to bind to
     #[arg(short = 's')]
-    source_host : Option<String>,
+    source_host: Option<String>,
 
     // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
     /// Port to bind to
     #[arg(short = 'p', default_value_t = 0)]
-    source_port : u16,
+    source_port: u16,
 
     /// Send buffer/datagram size
     #[arg(long = "sb", default_value_t = 1)]
-    sendbuf_size : u32,
+    sendbuf_size: u32,
 
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
-    is_zero_io : bool,
+    is_zero_io: bool,
 
     /// Send broadcast data (UDP only)
     #[arg(short = 'b', requires = "is_udp")]
-    is_broadcast : bool,
+    is_broadcast: bool,
 
     /// Disable console character mode
     #[arg(short = 'c')]
-    should_disable_console_char_mode : bool,
+    should_disable_console_char_mode: bool,
 
     /// Set Time-to-Live (hop count. IPv4 only)
     #[arg(short = 'i', long = "ttl")]
-    ttl_opt : Option<u32>,
+    ttl_opt: Option<u32>,
 
     /// Hostname to connect to
-    hostname : Option<String>,
+    #[arg(requires = "port")]
+    hostname: Option<String>,
 
     /// Port number to connect on
-    port : Option<u16>,
+    #[arg(requires = "hostname")]
+    port: Option<u16>,
 
     #[command(flatten)]
     af_limit: AfLimit,
 }
 
-fn usage(msg : &str) -> ! {
+fn usage(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
     eprintln!();
     let _ = NcArgs::command().print_help();
