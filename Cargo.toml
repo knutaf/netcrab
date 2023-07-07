@@ -13,4 +13,4 @@ tokio-stream = { version = "0.1" }
 bytes = "1.0.0"
 clap = { version = "4.2.2", features = ["derive"] }
 console = "0.15.7"
-
+socket2 = "0.5.3"

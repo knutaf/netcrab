@@ -1,3 +1,6 @@
+// For AsRawFd/AsRawSocket shenanigans.
+#![feature(trait_alias)]
+
 use std::sync::Arc;
 use std::io::Read;
 use std::io::Write;
@@ -14,6 +17,7 @@ use tokio_util::codec::BytesCodec;
 use clap::Parser;
 use clap::Args;
 use clap::CommandFactory;
+use sockconf::configure_socket_options;
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
 // of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
@@ -180,6 +184,79 @@ where
     }
 }
 
+mod sockconf {
+    use std::mem::ManuallyDrop;
+    use crate::NcArgs;
+    use crate::configure_socket2_options;
+
+    #[cfg(windows)]
+    use std::os::windows::io::{FromRawSocket, AsRawSocket};
+
+    #[cfg(unix)]
+    use std::os::fd::{FromRawFd, AsRawFd};
+
+    #[cfg(windows)]
+    pub trait AsRawHandleType = AsRawSocket;
+
+    #[cfg(unix)]
+    pub trait AsRawHandleType = AsRawFd;
+
+    // There isn't a clean way to get from a Tokio TcpSocket or UdpSocket to its inner socket2::Socket, which offers
+    // basically all the possible setsockopts wrapped nicely. We can create a socket2::Socket out of a raw socket/fd
+    // though. But the socket2::Socket takes ownership of the handle and will close it on dtor, so wrap it in
+    // `ManuallyDrop`, which lets us leak it deliberately. The socket is owned properly by the tokio socket anyway, so
+    // nothing is leaked.
+    //
+    // The way to create a socket2::Socket out of a raw handle/fd is different on Windows vs Unix, so support both ways.
+    // They only differ by whether RawSocket or RawFd is used.
+    //
+    // SAFETY:
+    // - the socket is a valid open socket at the point of this call.
+    // - the socket can be closed by closesocket - this doesn't apply, since we won't be closing it here.
+    pub fn configure_socket_options<S>(socket : &S, is_ipv4 : bool, args : &NcArgs) -> std::io::Result<()> 
+    where S : AsRawHandleType {
+        let socket2 = ManuallyDrop::new(unsafe {
+            #[cfg(windows)]
+            let s = socket2::Socket::from_raw_socket(socket.as_raw_socket());
+
+            #[cfg(unix)]
+            let s = socket2::Socket::from_raw_fd(socket.as_raw_fd());
+
+            s
+        });
+
+        configure_socket2_options(&socket2, is_ipv4, args)
+    }
+}
+
+fn configure_socket2_options(socket : &socket2::Socket, is_ipv4 : bool, args : &NcArgs) -> std::io::Result<()> {
+    let socktype = socket.r#type()?;
+
+    match socktype {
+        socket2::Type::DGRAM => {
+            socket.set_broadcast(args.is_broadcast)?;
+        },
+        socket2::Type::STREAM => {
+            // No stream-specific options for now
+        },
+        _ => {
+            eprintln!("Warning: unknown socket type {:?}", socktype);
+        },
+    }
+
+    socket.set_send_buffer_size(args.sendbuf_size as usize)?;
+
+    if let Some(ttl) = args.ttl_opt {
+        if is_ipv4 {
+            socket.set_ttl(ttl)?;
+        } else {
+            eprintln!("Warning: setting TTL for IPv6 socket not supported.");
+        }
+    }
+
+    Ok(())
+}
+
 async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
@@ -195,7 +272,7 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
 
         candidate_count += 1;
 
-        match tcp_connect_to_candidate(addr, source_addrs, args.sendbuf_size).await {
+        match tcp_connect_to_candidate(addr, source_addrs, args).await {
             Ok(tcp_stream) => {
                 if args.is_zero_io {
                     return Ok(());
@@ -217,12 +294,12 @@ async fn do_tcp_connect(hostname : &str, port : u16, source_addrs : &Vec<SocketA
     }
 }
 
-async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>, sendbuf_size : u32) -> std::io::Result<tokio::net::TcpStream> {
+async fn tcp_connect_to_candidate(addr : SocketAddr, source_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<tokio::net::TcpStream> {
     eprintln!("Connecting to {}", addr);
 
     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
 
-    socket.set_send_buffer_size(sendbuf_size)?;
+    configure_socket_options(&socket, addr.is_ipv4(), args)?;
 
     // Bind the local socket to the first local address that matches the address family of the destination.
     let source_addr = source_addrs.iter().find(|e| { e.is_ipv4() == addr.is_ipv4() }).ok_or(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "No matching local address matched destination host's address family"))?;
@@ -267,7 +344,8 @@ async fn do_tcp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
         let listening_socket = if listen_addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }?;
-        let _ = listening_socket.set_send_buffer_size(args.sendbuf_size);
+
+        configure_socket_options(&listening_socket, listen_addr.is_ipv4(), args)?;
         listening_socket.bind(*listen_addr)?;
         listening_sockets.push(listening_socket);
     }
@@ -359,11 +437,14 @@ async fn handle_tcp_stream(mut tcp_stream : tokio::net::TcpStream, should_disabl
     }
 }
 
-async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>) -> std::io::Result<Vec<UdpTrafficSocket>> {
+async fn bind_udp_sockets(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<Vec<UdpTrafficSocket>> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
-        listening_sockets.push(UdpTrafficSocket::new(tokio::net::UdpSocket::bind(*listen_addr).await?));
+        let socket = tokio::net::UdpSocket::bind(*listen_addr).await?;
+        configure_socket_options(&socket, listen_addr.is_ipv4(), args)?;
+
+        listening_sockets.push(UdpTrafficSocket::new(socket));
 
         eprintln!("Bound UDP socket to {}, family {}",
             listen_addr,
@@ -403,10 +484,8 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
         assert!(source_addrs.len() == 1);
 
         // Bind to a single socket that matches the address family of the target address.
-        let sockets = bind_udp_sockets(&source_addrs).await?;
+        let sockets = bind_udp_sockets(&source_addrs, args).await?;
         assert!(sockets.len() == 1);
-
-        sockets[0].socket.set_broadcast(args.is_broadcast)?;
 
         return handle_udp_sockets(sockets, Some((0, addr)), args).await;
     }
@@ -415,7 +494,7 @@ async fn do_udp_connection(hostname : &str, port : u16, source_addrs : &Vec<Sock
 }
 
 async fn do_udp_listen(listen_addrs : &Vec<SocketAddr>, args : &NcArgs) -> std::io::Result<()> {
-    let listeners = bind_udp_sockets(&listen_addrs).await?;
+    let listeners = bind_udp_sockets(&listen_addrs, args).await?;
     handle_udp_sockets(listeners, None, args).await
 }
 
@@ -537,7 +616,7 @@ struct AfLimit {
 
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
-struct NcArgs {
+pub struct NcArgs {
     /// Use UDP instead of TCP
     #[arg(short = 'u')]
     is_udp : bool,
@@ -567,13 +646,17 @@ struct NcArgs {
     #[arg(short = 'z', conflicts_with = "is_udp")]
     is_zero_io : bool,
 
-    /// Send broadcast data (outgoing UDP only)
-    #[arg(short = 'b', requires = "is_udp", conflicts_with = "is_listening", conflicts_with = "is_listening_repeatedly")]
+    /// Send broadcast data (UDP only)
+    #[arg(short = 'b', requires = "is_udp")]
     is_broadcast : bool,
 
     /// Disable console character mode
     #[arg(short = 'c')]
     should_disable_console_char_mode : bool,
+
+    /// Set Time-to-Live (hop count. IPv4 only)
+    #[arg(short = 'i', long = "ttl")]
+    ttl_opt : Option<u32>,
 
     /// Hostname to connect to
     hostname : Option<String>,
