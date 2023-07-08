@@ -271,7 +271,7 @@ fn configure_socket2_options(
         if is_ipv4 {
             socket.set_ttl(ttl)?;
         } else {
-            eprintln!("Warning: setting TTL for IPv6 socket not supported.");
+            socket.set_unicast_hops_v6(ttl)?;
         }
     }
 
@@ -765,7 +765,7 @@ pub struct NcArgs {
     #[arg(short = 'c')]
     should_disable_console_char_mode: bool,
 
-    /// Set Time-to-Live (hop count. IPv4 only)
+    /// Set Time-to-Live
     #[arg(short = 'i', long = "ttl")]
     ttl_opt: Option<u32>,
 
