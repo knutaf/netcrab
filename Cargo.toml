@@ -14,3 +14,4 @@ bytes = "1.0.0"
 clap = { version = "4.2.2", features = ["derive"] }
 console = "0.15.7"
 socket2 = "0.5.3"
+default-net = "0.16.0"

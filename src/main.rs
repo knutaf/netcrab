@@ -3,7 +3,6 @@
 
 use clap::{Args, CommandFactory, Parser};
 use futures::{channel::mpsc, future, SinkExt, StreamExt};
-use sockconf::configure_socket_options;
 use std::{
     io::{IsTerminal, Read, Write},
     net::SocketAddr,
@@ -196,8 +195,6 @@ where
 }
 
 mod sockconf {
-    use crate::configure_socket2_options;
-    use crate::NcArgs;
     use std::mem::ManuallyDrop;
 
     #[cfg(windows)]
@@ -215,22 +212,22 @@ mod sockconf {
     // There isn't a clean way to get from a Tokio TcpSocket or UdpSocket to its inner socket2::Socket, which offers
     // basically all the possible setsockopts wrapped nicely. We can create a socket2::Socket out of a raw socket/fd
     // though. But the socket2::Socket takes ownership of the handle and will close it on dtor, so wrap it in
-    // `ManuallyDrop`, which lets us leak it deliberately. The socket is owned properly by the tokio socket anyway, so
+    // `ManuallyDrop`, which lets us leak it deliberately. The socket is owned properly by the Tokio socket anyway, so
     // nothing is leaked.
     //
     // The way to create a socket2::Socket out of a raw handle/fd is different on Windows vs Unix, so support both ways.
     // They only differ by whether RawSocket or RawFd is used.
     //
+    // So as not to have to return the contents of the ManuallyDrop and to contain where this leaked socket goes, take
+    // a closure so the caller can pass in what to do with the socket.
+    //
     // SAFETY:
     // - the socket is a valid open socket at the point of this call.
     // - the socket can be closed by closesocket - this doesn't apply, since we won't be closing it here.
-    pub fn configure_socket_options<S>(
-        socket: &S,
-        is_ipv4: bool,
-        args: &NcArgs,
-    ) -> std::io::Result<()>
+    pub fn with_socket2_from_socket<S, F>(socket: &S, func: F) -> std::io::Result<()>
     where
         S: AsRawHandleType,
+        F: FnOnce(&socket2::Socket) -> std::io::Result<()>,
     {
         let socket2 = ManuallyDrop::new(unsafe {
             #[cfg(windows)]
@@ -242,40 +239,119 @@ mod sockconf {
             s
         });
 
-        configure_socket2_options(&socket2, is_ipv4, args)
+        func(&socket2)
     }
 }
 
-fn configure_socket2_options(
-    socket: &socket2::Socket,
-    is_ipv4: bool,
-    args: &NcArgs,
-) -> std::io::Result<()> {
-    let socktype = socket.r#type()?;
+fn configure_socket_options<S>(socket: &S, is_ipv4: bool, args: &NcArgs) -> std::io::Result<()>
+where
+    S: sockconf::AsRawHandleType,
+{
+    sockconf::with_socket2_from_socket(socket, |s2: &socket2::Socket| {
+        let socktype = s2.r#type()?;
 
-    match socktype {
-        socket2::Type::DGRAM => {
-            socket.set_broadcast(args.is_broadcast)?;
+        match socktype {
+            socket2::Type::DGRAM => {
+                s2.set_broadcast(args.is_broadcast)?;
+
+                let multicast_ttl = args.ttl_opt.unwrap_or(1);
+                if is_ipv4 {
+                    s2.set_multicast_loop_v4(!args.should_disable_multicast_loopback)?;
+                    s2.set_multicast_ttl_v4(multicast_ttl)?;
+                } else {
+                    s2.set_multicast_loop_v6(!args.should_disable_multicast_loopback)?;
+                    s2.set_multicast_hops_v6(multicast_ttl)?;
+                }
+            }
+            socket2::Type::STREAM => {
+                // No stream-specific options for now
+            }
+            _ => {
+                eprintln!("Warning: unknown socket type {:?}", socktype);
+            }
         }
-        socket2::Type::STREAM => {
-            // No stream-specific options for now
+
+        s2.set_send_buffer_size(args.sendbuf_size as usize)?;
+
+        // If joining a multicast group, the TTL param was used above for the multicast TTL. Don't set it as the unicast
+        // TTL too.
+        if !args.should_join_multicast_group {
+            if let Some(ttl) = args.ttl_opt {
+                if is_ipv4 {
+                    s2.set_ttl(ttl)?;
+                } else {
+                    s2.set_unicast_hops_v6(ttl)?;
+                }
+            }
         }
-        _ => {
-            eprintln!("Warning: unknown socket type {:?}", socktype);
+
+        Ok(())
+    })
+}
+
+fn get_interface_index_from_local_addr(local_addr: &SocketAddr) -> std::io::Result<u32> {
+    // The unspecified address won't show up in an enumeration of the machine's interfaces, but is represented
+    // by interface 0.
+    match local_addr {
+        SocketAddr::V4(v4) => {
+            if *v4.ip() == std::net::Ipv4Addr::UNSPECIFIED {
+                return Ok(0);
+            }
+        }
+        SocketAddr::V6(v6) => {
+            if *v6.ip() == std::net::Ipv6Addr::UNSPECIFIED {
+                return Ok(0);
+            }
+        }
+    };
+
+    let interfaces = default_net::get_interfaces();
+    match local_addr {
+        SocketAddr::V4(v4) => {
+            let ip = v4.ip();
+            interfaces.iter().find(|interface| {
+                interface
+                    .ipv4
+                    .iter()
+                    .any(|if_v4_addr| if_v4_addr.addr == *ip)
+            })
+        }
+        SocketAddr::V6(v6) => {
+            let ip = v6.ip();
+            interfaces.iter().find(|interface| {
+                interface
+                    .ipv6
+                    .iter()
+                    .any(|if_v6_addr| if_v6_addr.addr == *ip)
+            })
         }
     }
+    .map(|interface| interface.index)
+    .ok_or(std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        "Could not find local interface matching local address.",
+    ))
+}
 
-    socket.set_send_buffer_size(args.sendbuf_size as usize)?;
+fn join_multicast_group<S>(
+    socket: &S,
+    local_addr: &SocketAddr,
+    multi_addr: &SocketAddr,
+) -> std::io::Result<()>
+where
+    S: sockconf::AsRawHandleType,
+{
+    sockconf::with_socket2_from_socket(socket, |s2: &socket2::Socket| {
+        let interface_index = get_interface_index_from_local_addr(local_addr)?;
 
-    if let Some(ttl) = args.ttl_opt {
-        if is_ipv4 {
-            socket.set_ttl(ttl)?;
-        } else {
-            socket.set_unicast_hops_v6(ttl)?;
+        match multi_addr {
+            SocketAddr::V4(addr) => s2.join_multicast_v4_n(
+                addr.ip(),
+                &socket2::InterfaceIndexOrAddress::Index(interface_index),
+            ),
+            SocketAddr::V6(addr) => s2.join_multicast_v6(addr.ip(), interface_index),
         }
-    }
-
-    Ok(())
+    })
 }
 
 async fn do_tcp_connect(
@@ -583,6 +659,10 @@ async fn do_udp_connection(
         let sockets = bind_udp_sockets(&source_addrs, args).await?;
         assert!(sockets.len() == 1);
 
+        if args.should_join_multicast_group {
+            join_multicast_group(&*(sockets[0].socket), &source_addrs[0], &addr)?;
+        }
+
         return handle_udp_sockets(sockets, Some((0, addr)), args).await;
     }
 
@@ -766,15 +846,40 @@ pub struct NcArgs {
     should_disable_console_char_mode: bool,
 
     /// Set Time-to-Live
-    #[arg(short = 'i', long = "ttl")]
+    #[arg(short = 'i', long = "ttl", value_name = "TTL")]
     ttl_opt: Option<u32>,
 
+    /// Join multicast group given by hostname (outbound UDP only)
+    #[arg(
+        long = "mc",
+        requires = "is_udp",
+        requires = "hostname",
+        requires = "port"
+    )]
+    should_join_multicast_group: bool,
+
+    /// Disable multicast sockets seeing their own traffic
+    #[arg(
+        long = "mc_no_loop",
+        requires = "should_join_multicast_group",
+        default_value_t = false
+    )]
+    should_disable_multicast_loopback: bool,
+
     /// Hostname to connect to
-    #[arg(requires = "port")]
+    #[arg(
+        requires = "port",
+        conflicts_with = "is_listening",
+        conflicts_with = "is_listening_repeatedly"
+    )]
     hostname: Option<String>,
 
     /// Port number to connect on
-    #[arg(requires = "hostname")]
+    #[arg(
+        requires = "hostname",
+        conflicts_with = "is_listening",
+        conflicts_with = "is_listening_repeatedly"
+    )]
     port: Option<u16>,
 
     #[command(flatten)]
@@ -794,6 +899,13 @@ async fn main() -> Result<(), String> {
 
     if args.is_listening_repeatedly {
         args.is_listening = true;
+    }
+
+    // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
+    // bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to, choose the
+    // outbound multicast port because it's probably what they actually wanted.
+    if args.should_join_multicast_group && args.source_port == 0 {
+        args.source_port = args.port.unwrap();
     }
 
     // Converts Option<String> -> Option<&str>
