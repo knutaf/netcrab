@@ -6,9 +6,9 @@ use futures::{channel::mpsc, future, SinkExt, StreamExt};
 use std::{
     io::{IsTerminal, Read, Write},
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
 };
-use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
@@ -27,7 +27,7 @@ impl UdpTrafficSocket {
     }
 }
 
-enum StdinStatus {
+enum LocalInputStatus {
     StillOpen,
     Closed,
 }
@@ -44,15 +44,15 @@ fn format_io_err(err: std::io::Error) -> String {
 // If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
 fn setup_async_stdin_reader_thread(
     chunk_size: u32,
-    should_disable_console_char_mode: bool,
+    input_mode: InputMode,
 ) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
     // If the user is interactively using the program, by default use "character mode", which inputs a character on
-    // every keystroke rather than a full line when hitting enter. However, the user can request to use normal
-    // stdin mode.
-    let is_char_mode = std::io::stdin().is_terminal() && !should_disable_console_char_mode;
+    // every keystroke rather than a full line when hitting enter. However, the user can request to use normal stdin
+    // mode.
+    let is_char_mode = std::io::stdin().is_terminal() && (input_mode != InputMode::StdinNoCharMode);
 
     std::thread::Builder::new()
         .name("stdin_reader".to_string())
@@ -160,21 +160,60 @@ fn setup_async_stdin_reader_thread(
     rx_input
 }
 
+// Set up a stream and sink that just echoes the stream back into the sink.
+fn setup_echo_channel() -> (
+    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
+    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
+) {
+    // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
+    let (tx_input, rx_input) = mpsc::unbounded();
+
+    // Transform Bytes into Result<Bytes>.
+    let rx_input = Box::pin(rx_input.map(|e| Ok(e)));
+
+    // Transform SendError into std::io::Error.
+    let tx_input = Box::pin(tx_input.sink_map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("Echo tx failed! {}", e),
+        )
+    }));
+
+    (rx_input, tx_input)
+}
+
+fn setup_local_io(
+    sendbuf_size: u32,
+    input_mode: InputMode,
+) -> (
+    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
+    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
+) {
+    match input_mode {
+        InputMode::Stdin | InputMode::StdinNoCharMode => (
+            // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
+            Box::pin(setup_async_stdin_reader_thread(sendbuf_size, input_mode)),
+            Box::pin(FramedWrite::new(tokio::io::stdout(), BytesCodec::new())),
+        ),
+        InputMode::Echo => setup_echo_channel(),
+    }
+}
+
 // Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail out. It
 // most likely means the socket was closed. Stdin ending is not an error.
-async fn service_stdio_and_net<F1, F2>(
+async fn service_local_io_and_net<F1, F2>(
     stdin_to_net: F1,
     net_to_stdout: F2,
 ) -> Option<std::io::Result<()>>
 where
-    F1: futures::Future<Output = std::io::Result<StdinStatus>>,
+    F1: futures::Future<Output = std::io::Result<LocalInputStatus>>,
     F2: futures::Future<Output = std::io::Result<()>>,
 {
     tokio::select! {
         result = stdin_to_net => {
             match result {
-                Ok(StdinStatus::StillOpen) => None,
-                Ok(StdinStatus::Closed) => {
+                Ok(LocalInputStatus::StillOpen) => None,
+                Ok(LocalInputStatus::Closed) => {
                     eprintln!("End of stdin reached.");
                     Some(Ok(()))
                 },
@@ -379,8 +418,7 @@ async fn do_tcp_connect(
                     return Ok(());
                 } else {
                     // Return after first successful connection.
-                    return handle_tcp_stream(tcp_stream, args.should_disable_console_char_mode)
-                        .await;
+                    return handle_tcp_stream(tcp_stream, args.input_mode).await;
                 }
             }
             Err(e) => {
@@ -525,7 +563,7 @@ async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io
                 let stream_result = if args.is_zero_io {
                     Ok(())
                 } else {
-                    handle_tcp_stream(stream, args.should_disable_console_char_mode).await
+                    handle_tcp_stream(stream, args.input_mode).await
                 };
 
                 // After handling a client, either loop and accept another client or exit.
@@ -553,37 +591,34 @@ async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io
 
 async fn handle_tcp_stream(
     mut tcp_stream: tokio::net::TcpStream,
-    should_disable_console_char_mode: bool,
+    input_mode: InputMode,
 ) -> std::io::Result<()> {
     let (rx_socket, tx_socket) = tcp_stream.split();
 
-    // Start a new thread responsible for reading from stdin and sending the input over for this thread to read, so it
-    // can be done concurrently with reading/writing the TCP stream.
-    let mut stdin = setup_async_stdin_reader_thread(1, should_disable_console_char_mode);
-    let mut stdin_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
+    let (mut data_from_local, mut data_to_local) = setup_local_io(1, input_mode);
 
-    let mut stdout = FramedWrite::new(tokio::io::stdout(), BytesCodec::new());
+    // Set up a sink that ends up sending out of the TCP socket. Local data can be streamed straight into it.
+    let mut local_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
 
-    // Filter map Result<BytesMut, Error> stream into just a Bytes stream to match stdout Sink. On Error, log the error
-    // and end the stream.
-    let mut rx_net_stream = FramedRead::new(rx_socket, BytesCodec::new())
-        .filter_map(|bm| match bm {
+    // Set up a stream that produces chunks of data from the network. Filter map the Result<BytesMut, Error> stream into
+    // just a Bytes stream to match the data_to_local Sink. On Error, log the error and end the stream.
+    let mut net_to_local_stream =
+        FramedRead::new(rx_socket, BytesCodec::new()).filter_map(|bm| match bm {
             //BytesMut into Bytes
-            Ok(bm) => future::ready(Some(bm.freeze())),
+            Ok(bm) => future::ready(Some(Ok(bm.freeze()))),
             Err(e) => {
                 eprintln!("failed to read from socket; error={}", e);
                 future::ready(None)
             }
-        })
-        .map(Ok);
+        });
 
     // End when either the socket is closed or stdin/stdout is closed.
     tokio::select! {
-        result = stdin_to_net_sink.send_all(&mut stdin) => {
-            eprintln!("End of stdin reached.");
+        result = local_to_net_sink.send_all(&mut data_from_local) => {
+            eprintln!("End of outbound data from local machine reached.");
             result
         },
-        result = stdout.send_all(&mut rx_net_stream) => {
+        result = data_to_local.send_all(&mut net_to_local_stream) => {
             result
         },
     }
@@ -692,11 +727,8 @@ async fn handle_udp_sockets(
         );
     }
 
-    // Set up a thread to read from stdin. It will produce only chunks of the required datagram size to send.
-    let mut stdin =
-        setup_async_stdin_reader_thread(args.sendbuf_size, args.should_disable_console_char_mode);
-
-    let mut stdout = tokio::io::stdout();
+    let (mut data_from_local, mut data_to_local) =
+        setup_local_io(args.sendbuf_size, args.input_mode);
 
     // Track the list of known remote peers who have sent traffic to one of our listening sockets.
     let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
@@ -711,24 +743,23 @@ async fn handle_udp_sockets(
     loop {
         // Need to make a copy of it for use in this async operation, because it's set from from the recv path.
         let target_peer = next_target_peer.clone();
-        let stdin_to_net = async {
+        let local_to_net = async {
             if let Some((tx_socket, peer_addr)) = target_peer {
-                if let Some(Ok(b)) = stdin.next().await {
-                    assert!(b.len() == args.sendbuf_size as usize);
+                if let Some(Ok(b)) = data_from_local.next().await {
                     tx_socket.send_to(&b, peer_addr).await?;
-                    Ok(StdinStatus::StillOpen)
+                    Ok(LocalInputStatus::StillOpen)
                 } else {
-                    Ok(StdinStatus::Closed)
+                    Ok(LocalInputStatus::Closed)
                 }
             } else {
                 // If no destination peer is known, hang this async block, because there's nothing to do, nowhere to
-                // send stdin traffic. After the net_to_stdout async block completes, a target peer will be known and
+                // send outgoing traffic. After the net_to_local async block completes, a target peer will be known and
                 // this one can start doing something useful.
                 future::pending().await
             }
         };
 
-        let net_to_stdout = async {
+        let net_to_local = async {
             // Listen for incoming UDP packets on all sockets at the same time. select_all waits for the first
             // recv_from to complete and cancels waiting on all the rest.
             let (listen_result, i, _) = futures::future::select_all(
@@ -740,9 +771,9 @@ async fn handle_udp_sockets(
 
             match listen_result {
                 Ok((rx_bytes, peer_addr)) => {
-                    let recv_buf = sockets[i].recv_buf;
+                    let recv_buf = &sockets[i].recv_buf;
 
-                    // Set the destination peer address for stdin traffic to the first one we received data from.
+                    // Set the destination peer address for outbound traffic to the first one we received data from.
                     if next_target_peer.is_none() {
                         print_udp_assoc(&sockets[i].socket, &peer_addr);
                         next_target_peer = Some((sockets[i].socket.clone(), peer_addr.clone()));
@@ -763,10 +794,14 @@ async fn handle_udp_sockets(
                         eprintln!("Dropping datagram with unsupported size, larger than 2KB!");
                         Ok(())
                     } else {
-                        // Output only the amount of bytes received.
-                        stdout.write_all(&recv_buf[..rx_bytes]).await?;
+                        // Send to local only the portion of the receive buffer that was filled by the datagram's
+                        // payload. Have to copy here because we need to pass it to the sink, and then the receive path
+                        // reuses the buffer for getting the next datagram.
+                        data_to_local
+                            .send(bytes::Bytes::copy_from_slice(&recv_buf[..rx_bytes]))
+                            .await?;
 
-                        stdout.flush().await?;
+                        data_to_local.flush().await?;
                         Ok(())
                     }
                 }
@@ -786,7 +821,7 @@ async fn handle_udp_sockets(
             }
         };
 
-        match service_stdio_and_net(stdin_to_net, net_to_stdout).await {
+        match service_local_io_and_net(local_to_net, net_to_local).await {
             Some(res) => return res,
             None => {}
         }
@@ -803,6 +838,20 @@ struct AfLimit {
     /// Use IPv6 only
     #[arg(short = '6')]
     use_v6: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum InputMode {
+    /// Read from stdin
+    Stdin,
+
+    /// Stdin with character mode disabled
+    #[value(name = "stdin-nochar", alias = "snc")]
+    StdinNoCharMode,
+
+    /// Echo inbound packets back to network
+    #[value(name = "echo", alias = "e")]
+    Echo,
 }
 
 #[derive(clap::Parser)]
@@ -841,13 +890,13 @@ pub struct NcArgs {
     #[arg(short = 'b', requires = "is_udp")]
     is_broadcast: bool,
 
-    /// Disable console character mode
-    #[arg(short = 'c')]
-    should_disable_console_char_mode: bool,
-
     /// Set Time-to-Live
     #[arg(short = 'i', long = "ttl", value_name = "TTL")]
     ttl_opt: Option<u32>,
+
+    /// Input mode
+    #[arg(short = 'm', value_enum, default_value_t = InputMode::Stdin)]
+    input_mode: InputMode,
 
     /// Join multicast group given by hostname (outbound UDP only)
     #[arg(
