@@ -855,8 +855,12 @@ enum InputMode {
 }
 
 #[derive(clap::Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, disable_help_flag = true)]
 pub struct NcArgs {
+    /// this cruft (--help for long help)
+    #[arg(short = 'h')]
+    help: bool,
+
     /// Use UDP instead of TCP
     #[arg(short = 'u')]
     is_udp: bool,
