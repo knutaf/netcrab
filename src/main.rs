@@ -855,7 +855,9 @@ enum InputMode {
 }
 
 #[derive(clap::Parser)]
-#[command(author, version, about, long_about = None, disable_help_flag = true)]
+#[command(author, version, about, long_about = None, disable_help_flag = true, override_usage =
+r#"connect outbound: nc [options] hostname port
+       listen for inbound: nc [-l | -L] -p port [options]"#)]
 pub struct NcArgs {
     /// this cruft (--help for long help)
     #[arg(short = 'h')]
