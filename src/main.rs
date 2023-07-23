@@ -15,23 +15,25 @@ use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 // of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
 struct UdpTrafficSocket {
     socket: Arc<tokio::net::UdpSocket>,
-    recv_buf: [u8; 2000],
+    recv_buf: [u8; 2000], // arbitrary size, bigger than a 1500 byte datagram
 }
 
 impl UdpTrafficSocket {
     fn new(socket: tokio::net::UdpSocket) -> UdpTrafficSocket {
         UdpTrafficSocket {
             socket: Arc::new(socket),
-            recv_buf: [0; 2000], // arbitrary size, bigger than a 1500 byte datagram
+            recv_buf: [0; 2000],
         }
     }
 }
 
+// Represents the status of the input stream to the program, whether it's still open or has been closed.
 enum LocalInputStatus {
     StillOpen,
     Closed,
 }
 
+// Convenience method for formatting an io::Error to String.
 fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
@@ -120,7 +122,7 @@ fn setup_async_stdin_reader_thread(
                                 break;
                             }
 
-                            // The chunk was sent. Reset the available buffer to allow storing the net chunk.
+                            // The chunk was sent. Reset the available buffer to allow storing the next chunk.
                             available_buf = &mut read_buf[..];
                         }
                     }
@@ -145,7 +147,7 @@ fn setup_async_stdin_reader_thread(
                             break;
                         }
 
-                        // The chunk was sent. Reset the buffer to allow storing the net chunk.
+                        // The chunk was sent. Reset the buffer to allow storing the next chunk.
                         available_buf = &mut read_buf[..];
                     } else {
                         // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
@@ -161,15 +163,28 @@ fn setup_async_stdin_reader_thread(
 }
 
 // Set up a stream and sink that just echoes the stream back into the sink.
-fn setup_echo_channel() -> (
+fn setup_echo_channel(args: &NcArgs) -> (
     Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
     Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
 ) {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (tx_input, rx_input) = mpsc::unbounded();
 
-    // Transform Bytes into Result<Bytes>.
-    let rx_input = Box::pin(rx_input.map(|e| Ok(e)));
+    // Transform Bytes into Result<Bytes> and optionally also echo to stdout. Need to specify the boxed dynamic type
+    // here because the match arms have different concrete types.
+    let rx_input: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> = match args.output_mode {
+        OutputMode::Stdout => {
+            let mut stdout = std::io::stdout();
+            Box::pin(rx_input.inspect(move |e: &bytes::Bytes| {
+                let _ = stdout.write_all(&e);
+                let _ = stdout.flush();
+            }).map(Ok))
+        },
+        OutputMode::Null => {
+            // Transform Bytes into Result<Bytes>.
+            Box::pin(rx_input.map(Ok))
+        },
+    };
 
     // Transform SendError into std::io::Error.
     let tx_input = Box::pin(tx_input.sink_map_err(|e| {
@@ -184,37 +199,48 @@ fn setup_echo_channel() -> (
 
 fn setup_local_io(
     sendbuf_size: u32,
-    input_mode: InputMode,
+    args: &NcArgs,
 ) -> (
     Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
     Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
 ) {
-    match input_mode {
-        InputMode::Stdin | InputMode::StdinNoCharMode => (
+    match args.input_mode {
+        InputMode::Stdin | InputMode::StdinNoCharMode => {
+            let codec = BytesCodec::new();
+
+            // Setup an output sink that either goes to stdout or to the void, depending on the user's selection. Need
+            // to specify the type here because the match arms have different concrete types.
+            let output: Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>> = match args.output_mode {
+                OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
+                OutputMode::Null => Box::pin(FramedWrite::new(tokio::io::sink(), codec)),
+            };
+
+            (
             // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
-            Box::pin(setup_async_stdin_reader_thread(sendbuf_size, input_mode)),
-            Box::pin(FramedWrite::new(tokio::io::stdout(), BytesCodec::new())),
-        ),
-        InputMode::Echo => setup_echo_channel(),
+            Box::pin(setup_async_stdin_reader_thread(sendbuf_size, args.input_mode)),
+            output,
+            )
+        },
+        InputMode::Echo => setup_echo_channel(args),
     }
 }
 
-// Send stdin bytes to the TCP stream, and print out incoming bytes from the network. If any error occurs, bail out. It
-// most likely means the socket was closed. Stdin ending is not an error.
+// Send bytes from the local machine's input to the destination, and send incoming bytes to the local output. If any
+// error occurs, bail out. It most likely means the remote side was closed. The local input ending is not an error.
 async fn service_local_io_and_net<F1, F2>(
-    stdin_to_net: F1,
-    net_to_stdout: F2,
+    local_input_to_net: F1,
+    net_to_local_output: F2,
 ) -> Option<std::io::Result<()>>
 where
     F1: futures::Future<Output = std::io::Result<LocalInputStatus>>,
     F2: futures::Future<Output = std::io::Result<()>>,
 {
     tokio::select! {
-        result = stdin_to_net => {
+        result = local_input_to_net => {
             match result {
                 Ok(LocalInputStatus::StillOpen) => None,
                 Ok(LocalInputStatus::Closed) => {
-                    eprintln!("End of stdin reached.");
+                    eprintln!("End of local input reached.");
                     Some(Ok(()))
                 },
 
@@ -222,7 +248,7 @@ where
                 Err(_) => Some(result.and(Ok(()))),
             }
         },
-        result = net_to_stdout => {
+        result = net_to_local_output => {
             if result.is_err() {
                 Some(result)
             } else {
@@ -418,7 +444,7 @@ async fn do_tcp_connect(
                     return Ok(());
                 } else {
                     // Return after first successful connection.
-                    return handle_tcp_stream(tcp_stream, args.input_mode).await;
+                    return handle_tcp_stream(tcp_stream, args).await;
                 }
             }
             Err(e) => {
@@ -563,7 +589,7 @@ async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io
                 let stream_result = if args.is_zero_io {
                     Ok(())
                 } else {
-                    handle_tcp_stream(stream, args.input_mode).await
+                    handle_tcp_stream(stream, args).await
                 };
 
                 // After handling a client, either loop and accept another client or exit.
@@ -591,11 +617,11 @@ async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io
 
 async fn handle_tcp_stream(
     mut tcp_stream: tokio::net::TcpStream,
-    input_mode: InputMode,
+    args: &NcArgs,
 ) -> std::io::Result<()> {
     let (rx_socket, tx_socket) = tcp_stream.split();
 
-    let (mut data_from_local, mut data_to_local) = setup_local_io(1, input_mode);
+    let (mut data_from_local, mut data_to_local) = setup_local_io(1, args);
 
     // Set up a sink that ends up sending out of the TCP socket. Local data can be streamed straight into it.
     let mut local_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
@@ -612,7 +638,7 @@ async fn handle_tcp_stream(
             }
         });
 
-    // End when either the socket is closed or stdin/stdout is closed.
+    // End when either the socket is closed or the local IO is closed.
     tokio::select! {
         result = local_to_net_sink.send_all(&mut data_from_local) => {
             eprintln!("End of outbound data from local machine reached.");
@@ -728,7 +754,7 @@ async fn handle_udp_sockets(
     }
 
     let (mut data_from_local, mut data_to_local) =
-        setup_local_io(args.sendbuf_size, args.input_mode);
+        setup_local_io(args.sendbuf_size, args);
 
     // Track the list of known remote peers who have sent traffic to one of our listening sockets.
     let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
@@ -854,6 +880,16 @@ enum InputMode {
     Echo,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum OutputMode {
+    /// Output to stdout
+    Stdout,
+
+    /// No output
+    #[value(name = "none", alias = "no")]
+    Null,
+}
+
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None, disable_help_flag = true, override_usage =
 r#"connect outbound: nc [options] hostname port
@@ -897,12 +933,19 @@ pub struct NcArgs {
     is_broadcast: bool,
 
     /// Set Time-to-Live
-    #[arg(short = 'i', long = "ttl", value_name = "TTL")]
+    #[arg(long = "ttl", value_name = "TTL")]
     ttl_opt: Option<u32>,
 
     /// Input mode
-    #[arg(short = 'm', value_enum, default_value_t = InputMode::Stdin)]
+    #[arg(short = 'i', value_enum, default_value_t = InputMode::Stdin)]
     input_mode: InputMode,
+
+    /// Output mode
+    #[arg(short = 'o', value_name = "OUTPUT_MODE")]
+    output_mode_opt: Option<OutputMode>,
+
+    #[arg(hide = true, value_enum, default_value_t = OutputMode::Stdout)]
+    output_mode: OutputMode,
 
     /// Join multicast group given by hostname (outbound UDP only)
     #[arg(
@@ -955,6 +998,16 @@ async fn main() -> Result<(), String> {
     if args.is_listening_repeatedly {
         args.is_listening = true;
     }
+
+    // If output mode is not explicitly specified, assign it based on input mode.
+    args.output_mode = if let Some(mode) = args.output_mode_opt {
+        mode
+    } else {
+        match args.input_mode {
+            InputMode::Stdin | InputMode::StdinNoCharMode => OutputMode::Stdout,
+            InputMode::Echo => OutputMode::Null,
+        }
+    };
 
     // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
     // bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to, choose the
