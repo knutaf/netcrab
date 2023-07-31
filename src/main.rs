@@ -3,6 +3,7 @@
 
 use clap::{Args, CommandFactory, Parser};
 use futures::{channel::mpsc, future, SinkExt, StreamExt};
+use rand::{distributions::Distribution, Rng};
 use std::{
     io::{IsTerminal, Read, Write},
     net::SocketAddr,
@@ -10,6 +11,21 @@ use std::{
     sync::Arc,
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+
+#[macro_use]
+extern crate lazy_static;
+
+lazy_static! {
+    // Make a static vector with all printable ASCII characters. If we wanted to avoid a static allocation we'd need to
+    // implement a sibling of RandBytesIter that contains this vector with it, so that Slice could reference within the
+    // object.
+    static ref ASCII_CHARS_STORAGE : Vec<u8> = {
+        (0u8..=u8::MAX).filter(|i| {
+            let c = *i as char;
+            c.is_ascii() && !c.is_control()
+        }).collect()
+    };
+}
 
 // A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
 // of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
@@ -163,7 +179,9 @@ fn setup_async_stdin_reader_thread(
 }
 
 // Set up a stream and sink that just echoes the stream back into the sink.
-fn setup_echo_channel(args: &NcArgs) -> (
+fn setup_echo_channel(
+    args: &NcArgs,
+) -> (
     Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
     Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
 ) {
@@ -172,19 +190,24 @@ fn setup_echo_channel(args: &NcArgs) -> (
 
     // Transform Bytes into Result<Bytes> and optionally also echo to stdout. Need to specify the boxed dynamic type
     // here because the match arms have different concrete types.
-    let rx_input: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> = match args.output_mode {
-        OutputMode::Stdout => {
-            let mut stdout = std::io::stdout();
-            Box::pin(rx_input.inspect(move |e: &bytes::Bytes| {
-                let _ = stdout.write_all(&e);
-                let _ = stdout.flush();
-            }).map(Ok))
-        },
-        OutputMode::Null => {
-            // Transform Bytes into Result<Bytes>.
-            Box::pin(rx_input.map(Ok))
-        },
-    };
+    let rx_input: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> =
+        match args.output_mode {
+            OutputMode::Stdout => {
+                let mut stdout = std::io::stdout();
+                Box::pin(
+                    rx_input
+                        .inspect(move |e: &bytes::Bytes| {
+                            let _ = stdout.write_all(&e);
+                            let _ = stdout.flush();
+                        })
+                        .map(Ok),
+                )
+            }
+            OutputMode::Null => {
+                // Transform Bytes into Result<Bytes>.
+                Box::pin(rx_input.map(Ok))
+            }
+        };
 
     // Transform SendError into std::io::Error.
     let tx_input = Box::pin(tx_input.sink_map_err(|e| {
@@ -197,11 +220,103 @@ fn setup_echo_channel(args: &NcArgs) -> (
     (rx_input, tx_input)
 }
 
+// An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
+// Result<Bytes> to fit the way it is used to produce a stream of Bytes.
+struct RandBytesIter<'a, TDist>
+where
+    TDist: rand::distributions::Distribution<u8>,
+{
+    args: &'a NcArgs,
+
+    // TODO: Would rather make this a template type or impl that satisfies Iterator<Item = u8> but don't know how to
+    // express that.
+    rand_iter: rand::distributions::DistIter<TDist, rand::rngs::ThreadRng, u8>,
+    rng: rand::rngs::ThreadRng,
+
+    // Temporary storage for filling the next chunk before it's emitted from next(). Stored here to reduce allocations.
+    chunk_storage: Vec<u8>,
+}
+
+impl<'a, TDist> RandBytesIter<'a, TDist>
+where
+    TDist: rand::distributions::Distribution<u8>,
+{
+    fn new(args: &'a NcArgs, dist: TDist) -> RandBytesIter<TDist> {
+        RandBytesIter {
+            args,
+            rand_iter: rand::thread_rng().sample_iter(dist),
+            rng: rand::thread_rng(),
+            chunk_storage: vec![0u8; args.rand_config.size_max],
+        }
+    }
+}
+
+impl<'a, TDist> Iterator for RandBytesIter<'a, TDist>
+where
+    TDist: rand::distributions::Distribution<u8>,
+{
+    type Item = std::io::Result<bytes::Bytes>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Figure out the next random size of the chunk.
+        let next_size = self
+            .rng
+            .gen_range(self.args.rand_config.size_min..=self.args.rand_config.size_max);
+
+        // Fill that amount of the temporary storage with random data.
+        for i in 0..next_size {
+            self.chunk_storage[i] = self.rand_iter.next().unwrap();
+        }
+
+        // Generate a Bytes that contains that portion of the data. For now this is an allocation.
+        // TODO: can we get rid of this allocation?
+        Some(Ok(bytes::Bytes::copy_from_slice(
+            &self.chunk_storage[0..next_size],
+        )))
+    }
+}
+
+fn setup_random_io(
+    args: &NcArgs,
+) -> (
+    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + '_>>,
+    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
+) {
+    // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here because
+    // the match arms have different concrete types (different Distribution implementations).
+    let rng_iter: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> =
+        match args.rand_config.vals {
+            RandValueType::Binary => {
+                // Use a standard distribution across all u8 values.
+                Box::pin(futures::stream::iter(RandBytesIter::new(
+                    args,
+                    rand::distributions::Standard,
+                )))
+            }
+            RandValueType::Ascii => {
+                // Make a distribution that references only ASCII characters. Slice returns a reference to the element in the
+                // original array, so map and dereference to return u8 instead of &u8.
+                let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
+                    .unwrap()
+                    .map(|e| *e);
+                Box::pin(futures::stream::iter(RandBytesIter::new(
+                    args,
+                    ascii_dist,
+                )))
+            }
+        };
+
+    (
+        rng_iter,
+        Box::pin(FramedWrite::new(tokio::io::stdout(), BytesCodec::new())),
+    )
+}
+
 fn setup_local_io(
     sendbuf_size: u32,
     args: &NcArgs,
 ) -> (
-    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
+    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + '_>>,
     Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
 ) {
     match args.input_mode {
@@ -210,18 +325,23 @@ fn setup_local_io(
 
             // Setup an output sink that either goes to stdout or to the void, depending on the user's selection. Need
             // to specify the type here because the match arms have different concrete types.
-            let output: Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>> = match args.output_mode {
-                OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
-                OutputMode::Null => Box::pin(FramedWrite::new(tokio::io::sink(), codec)),
-            };
+            let output: Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>> =
+                match args.output_mode {
+                    OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
+                    OutputMode::Null => Box::pin(FramedWrite::new(tokio::io::sink(), codec)),
+                };
 
             (
-            // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
-            Box::pin(setup_async_stdin_reader_thread(sendbuf_size, args.input_mode)),
-            output,
+                // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
+                Box::pin(setup_async_stdin_reader_thread(
+                    sendbuf_size,
+                    args.input_mode,
+                )),
+                output,
             )
-        },
+        }
         InputMode::Echo => setup_echo_channel(args),
+        InputMode::Random => setup_random_io(args),
     }
 }
 
@@ -753,8 +873,7 @@ async fn handle_udp_sockets(
         );
     }
 
-    let (mut data_from_local, mut data_to_local) =
-        setup_local_io(args.sendbuf_size, args);
+    let (mut data_from_local, mut data_to_local) = setup_local_io(args.sendbuf_size, args);
 
     // Track the list of known remote peers who have sent traffic to one of our listening sockets.
     let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
@@ -854,7 +973,7 @@ async fn handle_udp_sockets(
     }
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 #[group(required = false, multiple = false)]
 struct AfLimit {
     /// Use IPv4 only
@@ -878,6 +997,10 @@ enum InputMode {
     /// Echo inbound packets back to network
     #[value(name = "echo", alias = "e")]
     Echo,
+
+    /// Generate random data to send to the network
+    #[value(name = "rand", alias = "r")]
+    Random,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
@@ -890,7 +1013,34 @@ enum OutputMode {
     Null,
 }
 
-#[derive(clap::Parser)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum RandValueType {
+    /// Binary data
+    #[value(name = "binary", alias = "b")]
+    Binary,
+
+    /// ASCII data
+    #[value(name = "ascii", alias = "a")]
+    Ascii,
+}
+
+#[derive(Args, Clone)]
+#[group(required = false, multiple = true)]
+struct RandConfig {
+    /// Min size for random sends
+    #[arg(long = "rsizemin", default_value_t = 1)]
+    size_min: usize,
+
+    /// Max size for random sends
+    #[arg(long = "rsizemax", default_value_t = 1450)]
+    size_max: usize,
+
+    /// Random value selection
+    #[arg(long = "rvals", value_enum, default_value_t = RandValueType::Binary)]
+    vals: RandValueType,
+}
+
+#[derive(clap::Parser, Clone)]
 #[command(author, version, about, long_about = None, disable_help_flag = true, override_usage =
 r#"connect outbound: nc [options] hostname port
        listen for inbound: nc [-l | -L] -p port [options]"#)]
@@ -898,6 +1048,9 @@ pub struct NcArgs {
     /// this cruft (--help for long help)
     #[arg(short = 'h')]
     help: bool,
+
+    #[arg(long = "help", hide = true)]
+    help_more: bool,
 
     /// Use UDP instead of TCP
     #[arg(short = 'u')]
@@ -944,7 +1097,7 @@ pub struct NcArgs {
     #[arg(short = 'o', value_name = "OUTPUT_MODE")]
     output_mode_opt: Option<OutputMode>,
 
-    #[arg(hide = true, value_enum, default_value_t = OutputMode::Stdout)]
+    #[arg(long = "override_output_mode", hide = true, value_enum, default_value_t = OutputMode::Stdout)]
     output_mode: OutputMode,
 
     /// Join multicast group given by hostname (outbound UDP only)
@@ -982,6 +1135,9 @@ pub struct NcArgs {
 
     #[command(flatten)]
     af_limit: AfLimit,
+
+    #[command(flatten)]
+    rand_config: RandConfig,
 }
 
 fn usage(msg: &str) -> ! {
@@ -995,6 +1151,11 @@ fn usage(msg: &str) -> ! {
 async fn main() -> Result<(), String> {
     let mut args = NcArgs::parse();
 
+    if args.help_more {
+        let _ = NcArgs::command().print_long_help();
+        std::process::exit(1)
+    }
+
     if args.is_listening_repeatedly {
         args.is_listening = true;
     }
@@ -1004,7 +1165,7 @@ async fn main() -> Result<(), String> {
         mode
     } else {
         match args.input_mode {
-            InputMode::Stdin | InputMode::StdinNoCharMode => OutputMode::Stdout,
+            InputMode::Stdin | InputMode::StdinNoCharMode | InputMode::Random => OutputMode::Stdout,
             InputMode::Echo => OutputMode::Null,
         }
     };
