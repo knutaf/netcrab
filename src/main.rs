@@ -299,10 +299,7 @@ fn setup_random_io(
                 let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
                     .unwrap()
                     .map(|e| *e);
-                Box::pin(futures::stream::iter(RandBytesIter::new(
-                    args,
-                    ascii_dist,
-                )))
+                Box::pin(futures::stream::iter(RandBytesIter::new(args, ascii_dist)))
             }
         };
 
