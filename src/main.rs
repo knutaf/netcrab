@@ -1,7 +1,7 @@
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
-use clap::{Args, CommandFactory, Parser};
+use clap::{Args, CommandFactory, Parser, ValueEnum};
 use futures::{channel::mpsc, future, SinkExt, StreamExt};
 use rand::{distributions::Distribution, Rng};
 use std::{
@@ -11,6 +11,13 @@ use std::{
     sync::Arc,
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+
+// Lifetime specifier is needed because in some places the local stream incorporates an object that references function
+// parameters (i.e. '_).
+type LocalStreamToRemote<'a> =
+    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + 'a>>;
+type RemoteToLocalSink = Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>;
+type LocalIoStreamAndSink<'a> = (LocalStreamToRemote<'a>, RemoteToLocalSink);
 
 #[macro_use]
 extern crate lazy_static;
@@ -52,6 +59,15 @@ enum LocalInputStatus {
 // Convenience method for formatting an io::Error to String.
 fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
+}
+
+// Setup an output sink that either goes to stdout or to the void, depending on the user's selection.
+fn setup_local_output(args: &NcArgs) -> RemoteToLocalSink {
+    let codec = BytesCodec::new();
+    match args.output_mode {
+        OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
+        OutputMode::Null => Box::pin(FramedWrite::new(tokio::io::sink(), codec)),
+    }
 }
 
 // Tokio's async Stdin implementation doesn't work well for interactive uses. It uses a blocking read, so if we notice
@@ -178,46 +194,41 @@ fn setup_async_stdin_reader_thread(
     rx_input
 }
 
-// Set up a stream and sink that just echoes the stream back into the sink.
-fn setup_echo_channel(
-    args: &NcArgs,
-) -> (
-    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>>,
-    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
-) {
+// Set up a stream and sink that just echoes the stream back into the sink. The caller writes data from the network to
+// the sink, and that passes through the mpsc channel and is read by the stream, which the caller sends to the network.
+fn setup_echo_channel(args: &NcArgs) -> LocalIoStreamAndSink {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
-    let (tx_input, rx_input) = mpsc::unbounded();
+    let (remote_to_local_sink, local_stream_to_remote) = mpsc::unbounded();
 
     // Transform Bytes into Result<Bytes> and optionally also echo to stdout. Need to specify the boxed dynamic type
     // here because the match arms have different concrete types.
-    let rx_input: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> =
-        match args.output_mode {
-            OutputMode::Stdout => {
-                let mut stdout = std::io::stdout();
-                Box::pin(
-                    rx_input
-                        .inspect(move |e: &bytes::Bytes| {
-                            let _ = stdout.write_all(&e);
-                            let _ = stdout.flush();
-                        })
-                        .map(Ok),
-                )
-            }
-            OutputMode::Null => {
-                // Transform Bytes into Result<Bytes>.
-                Box::pin(rx_input.map(Ok))
-            }
-        };
+    let local_stream_to_remote: LocalStreamToRemote = match args.output_mode {
+        OutputMode::Stdout => {
+            let mut stdout = std::io::stdout();
+            Box::pin(
+                local_stream_to_remote
+                    .inspect(move |e: &bytes::Bytes| {
+                        let _ = stdout.write_all(&e);
+                        let _ = stdout.flush();
+                    })
+                    .map(Ok),
+            )
+        }
+        OutputMode::Null => {
+            // Transform Bytes into Result<Bytes>.
+            Box::pin(local_stream_to_remote.map(Ok))
+        }
+    };
 
     // Transform SendError into std::io::Error.
-    let tx_input = Box::pin(tx_input.sink_map_err(|e| {
+    let remote_to_local_sink = Box::pin(remote_to_local_sink.sink_map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             format!("Echo tx failed! {}", e),
         )
     }));
 
-    (rx_input, tx_input)
+    (local_stream_to_remote, remote_to_local_sink)
 }
 
 // An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
@@ -276,65 +287,44 @@ where
     }
 }
 
-fn setup_random_io(
-    args: &NcArgs,
-) -> (
-    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + '_>>,
-    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
-) {
+fn setup_random_io(args: &NcArgs) -> LocalIoStreamAndSink {
     // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here because
     // the match arms have different concrete types (different Distribution implementations).
-    let rng_iter: Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>>>> =
-        match args.rand_config.vals {
-            RandValueType::Binary => {
-                // Use a standard distribution across all u8 values.
-                Box::pin(futures::stream::iter(RandBytesIter::new(
-                    args,
-                    rand::distributions::Standard,
-                )))
-            }
-            RandValueType::Ascii => {
-                // Make a distribution that references only ASCII characters. Slice returns a reference to the element in the
-                // original array, so map and dereference to return u8 instead of &u8.
-                let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
-                    .unwrap()
-                    .map(|e| *e);
-                Box::pin(futures::stream::iter(RandBytesIter::new(args, ascii_dist)))
-            }
-        };
+    let rng_iter: LocalStreamToRemote = match args.rand_config.vals {
+        RandValueType::Binary => {
+            // Use a standard distribution across all u8 values.
+            Box::pin(futures::stream::iter(RandBytesIter::new(
+                args,
+                rand::distributions::Standard,
+            )))
+        }
+        RandValueType::Ascii => {
+            // Make a distribution that references only ASCII characters. Slice returns a reference to the element in the
+            // original array, so map and dereference to return u8 instead of &u8.
+            let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
+                .unwrap()
+                .map(|e| *e);
+            Box::pin(futures::stream::iter(RandBytesIter::new(args, ascii_dist)))
+        }
+    };
 
-    (
-        rng_iter,
-        Box::pin(FramedWrite::new(tokio::io::stdout(), BytesCodec::new())),
-    )
+    (rng_iter, setup_local_output(args))
 }
 
-fn setup_local_io(
-    sendbuf_size: u32,
-    args: &NcArgs,
-) -> (
-    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + '_>>,
-    Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>,
-) {
+fn setup_local_io(sendbuf_size: u32, args: &NcArgs) -> LocalIoStreamAndSink {
     match args.input_mode {
+        InputMode::Null => (
+            Box::pin(futures::stream::pending()),
+            setup_local_output(args),
+        ),
         InputMode::Stdin | InputMode::StdinNoCharMode => {
-            let codec = BytesCodec::new();
-
-            // Setup an output sink that either goes to stdout or to the void, depending on the user's selection. Need
-            // to specify the type here because the match arms have different concrete types.
-            let output: Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>> =
-                match args.output_mode {
-                    OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
-                    OutputMode::Null => Box::pin(FramedWrite::new(tokio::io::sink(), codec)),
-                };
-
             (
                 // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
                 Box::pin(setup_async_stdin_reader_thread(
                     sendbuf_size,
                     args.input_mode,
                 )),
-                output,
+                setup_local_output(args),
             )
         }
         InputMode::Echo => setup_echo_channel(args),
@@ -984,6 +974,10 @@ struct AfLimit {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 enum InputMode {
+    /// No input
+    #[value(name = "none", alias = "no")]
+    Null,
+
     /// Read from stdin
     Stdin,
 
@@ -1091,10 +1085,7 @@ pub struct NcArgs {
     input_mode: InputMode,
 
     /// Output mode
-    #[arg(short = 'o', value_name = "OUTPUT_MODE")]
-    output_mode_opt: Option<OutputMode>,
-
-    #[arg(long = "override_output_mode", hide = true, value_enum, default_value_t = OutputMode::Stdout)]
+    #[arg(short = 'o', value_enum, default_value_t = OutputMode::Stdout)]
     output_mode: OutputMode,
 
     /// Join multicast group given by hostname (outbound UDP only)
@@ -1157,15 +1148,23 @@ async fn main() -> Result<(), String> {
         args.is_listening = true;
     }
 
-    // If output mode is not explicitly specified, assign it based on input mode.
-    args.output_mode = if let Some(mode) = args.output_mode_opt {
-        mode
-    } else {
-        match args.input_mode {
-            InputMode::Stdin | InputMode::StdinNoCharMode | InputMode::Random => OutputMode::Stdout,
-            InputMode::Echo => OutputMode::Null,
+    // If a user is redirecting stdout to a file, then stdin typically starts off at EOF, which makes the local stream
+    // end too quickly, so override the input mode to just hang and allow the output to proceed.
+    //
+    // But if the user is also redirecting stdin from a file, then that should take precedence and allow the input mode
+    // to remain so it can read from file.
+    match args.input_mode {
+        InputMode::Stdin | InputMode::StdinNoCharMode => {
+            if std::io::stdin().is_terminal() && !std::io::stdout().is_terminal() {
+                eprintln!(
+                    "Changing input mode from \"{}\" to \"none\" because stdin is empty.",
+                    args.input_mode.to_possible_value().unwrap().get_name()
+                );
+                args.input_mode = InputMode::Null;
+            }
         }
-    };
+        _ => {}
+    }
 
     // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
     // bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to, choose the
