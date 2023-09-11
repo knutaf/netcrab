@@ -1,10 +1,12 @@
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
+use bytes::Bytes;
 use clap::{Args, CommandFactory, Parser, ValueEnum};
-use futures::{channel::mpsc, future, SinkExt, StreamExt};
+use futures::{channel::mpsc, future, stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
 use rand::{distributions::Distribution, Rng};
 use std::{
+    collections::HashMap,
     io::{IsTerminal, Read, Write},
     net::SocketAddr,
     pin::Pin,
@@ -12,12 +14,94 @@ use std::{
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
+// Some useful general notes about Rust async progarmming that might help when reading this code here.
+//
+// Many parts of the program use futures. A future is an object that contains some processing to defer eventually. It
+// can be passed around and stored, and when we want to retrieve the value it will produce, we call `await`. Another
+// way to get that value is to pass the future to a function like `select`.
+//
+// When we call `await` and the value isn't ready yet, the Tokio runtime switches to processing other tasks and will
+// wake up when the value is ready.
+//
+// `select` lets you wait on multiple different types of futures at the same time and handle each type's completion with
+// different code.
+//
+// This code heavily uses Sinks and Streams.
+//
+// A Sink is an object that accepts data via the `send` or `send_all` call. The generic type of the sink indicates what
+// data type must be supplied to the Sink, and we can use the `with` method to change what type it accepts, like an
+// adapter.
+//
+// A Stream is an object that *asynchronously* produces bytes, the asynchronous analog of an Iterator. You can pull data
+// out of it using the `next` call or by passing it to a Sink's `send_all` call. Like an iterator, you can call `map` or
+// various other methods to change the data type that is produced by the Stream.
+
+// Bytes sourced from the local machine are marked with a special peer address so they can be treated similarly to
+// sockets even when it's not a real socket (and therefore doesn't have a real network address.
+const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::UNSPECIFIED,
+    0,
+));
+
+// A buffer of bytes that also carries the remote peer that sent it to this machine. Used for figuring out which remote
+// machines it should be forwarded to.
+#[derive(Debug)]
+struct SourcedBytes {
+    data: Bytes,
+    peer: SocketAddr,
+}
+
+impl SourcedBytes {
+    // Wrap bytes that were produced by the local machine with the special local peer address that marks them as
+    // originating from the local machine. As a convenience, also wrap in a Result, which is what the various streams
+    // and sinks need.
+    fn ok_from_local(data: Bytes) -> std::io::Result<SourcedBytes> {
+        Ok(SourcedBytes {
+            data,
+            peer: LOCAL_IO_PEER_ADDR,
+        })
+    }
+}
+
+// A grouping of a data buffer plus the address it should be sent to. Primarly used for UDP traffic, where the
+// `UdpFramed` sink and stream use this tuple.
+type TargetedBytes = (Bytes, SocketAddr);
+
+// A stream of bytes produced from the local machine. In contrast with bytes that come from the network, it has no
+// source address, though that is faked later in order to make it be treated just like other sockets by the router for
+// purposes of forwarding.
+//
 // Lifetime specifier is needed because in some places the local stream incorporates an object that references function
 // parameters (i.e. '_).
-type LocalStreamToRemote<'a> =
-    Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + 'a>>;
-type RemoteToLocalSink = Pin<Box<dyn futures::Sink<bytes::Bytes, Error = std::io::Error>>>;
-type LocalIoStreamAndSink<'a> = (LocalStreamToRemote<'a>, RemoteToLocalSink);
+type LocalIoStream<'a> = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + 'a>>;
+
+// A sink that accepts byte buffers and sends them to the local IO function (stdout, echo, null, etc.).
+type LocalIoSink = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error>>>;
+
+// When setting up local IO, it's common to set up both the way input enters the program and where output from the
+// program should go.
+type LocalIoSinkAndStream<'a> = (LocalIoSink, LocalIoStream<'a>);
+
+// A sink that accepts TargetedBytes -- a byte buffer plus the destination it should go to. Note that for TCP sockets,
+// the destination is ignored, because each socket already implicitly contains the destination.
+//
+// When the router determines that data should be sent to a socket, it sends it into this sink, where there is one per
+// remote peer.
+type RouterToNetSink = Pin<Box<dyn futures::Sink<TargetedBytes, Error = std::io::Error>>>;
+
+// A stream of bytes plus the destination it should go to, produced by the router and consumed by a socket. The socket
+// uses `send_all` to drive data from this stream into its per-socket sink and thus out to the network.
+type RouterToNetStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<TargetedBytes>>>>;
+
+// A sink of bytes originating from some remote peer. Each socket drives data received on it to the router using this
+// sink, supplying where the data came from. The router uses the data's origin to decide where the data should be
+// forwarded to.
+type NetToRouterSink = Pin<Box<dyn futures::Sink<SourcedBytes, Error = std::io::Error>>>;
+
+// When the program wants to add a new remote peer to the router so that the router can forward data to it, the router
+// provides a sink for the socket to send data into to reach the router; and a stream of data from the router that the
+// socket should send to the remote peer.
+type RouteSinkAndStream = (NetToRouterSink, RouterToNetStream);
 
 #[macro_use]
 extern crate lazy_static;
@@ -34,26 +118,200 @@ lazy_static! {
     };
 }
 
-// A refcounted socket plus a recv buffer to accompany it, especially useful when listening for traffic on a collection
-// of sockets at the same time, so each socket has its own associated receive buffer during the asynchronous operation.
-struct UdpTrafficSocket {
-    socket: Arc<tokio::net::UdpSocket>,
-    recv_buf: [u8; 2000], // arbitrary size, bigger than a 1500 byte datagram
+// Core logic used by the router to decide where to forward messages.
+fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> bool {
+    // In echo mode, allow sending data back to the source.
+    if source == dest && args.input_mode != InputMode::Echo {
+        if args.verbose {
+            eprintln!("Skipping forwarding back to source.");
+        }
+
+        return false;
+    }
+
+    // When brokering, any incoming traffic should be sent back to all other peers.
+    // When not brokering, only send to the local output or back to the source (only possible in
+    // echo mode).
+    if !args.should_broker
+        && (dest != source)
+        && *dest != LOCAL_IO_PEER_ADDR
+        && *source != LOCAL_IO_PEER_ADDR
+    {
+        if args.verbose {
+            eprintln!("Skipping forwarding to other remote endpoint due to not broker mode.");
+        }
+
+        return false;
+    }
+
+    true
 }
 
-impl UdpTrafficSocket {
-    fn new(socket: tokio::net::UdpSocket) -> UdpTrafficSocket {
-        UdpTrafficSocket {
-            socket: Arc::new(socket),
-            recv_buf: [0; 2000],
+// An object that manages a set of known peers. It accepts data from one or more sockets and forwards incoming data
+// either just to the local output or to other known peers, depending on the `should_broker` flag. The reason it is
+// specific to TCP is because the sockets that it manages have the destination address embedded in them, unlike UDP,
+// where a single socket sends to multiple destinations.
+struct TcpRouter<'a> {
+    args: &'a NcArgs,
+
+    // A collection of known remote peers, indexed by the remote peer address. Each known peer has a sink that is used
+    // for the router to send data to that peer.
+    routes: HashMap<SocketAddr, RouterToNetSink>,
+
+    // A sink where all sockets send data to the router for forwarding. Normally this would just be an UnboundedSender,
+    // but since we map the send error, it gets stored as a complicated type. Thanks, Rust.
+    net_collector_sink: futures::sink::SinkMapErr<
+        mpsc::UnboundedSender<SourcedBytes>,
+        fn(mpsc::SendError) -> std::io::Error,
+    >,
+
+    // An internal stream that produces all of the data from all sockets that come into the router.
+    inbound_net_traffic_stream: mpsc::UnboundedReceiver<SourcedBytes>,
+
+    // A stream of data produced from input to the program.
+    local_io_stream: LocalIoStream<'a>,
+
+    // A sink where the router can send data to be printed out.
+    local_io_sink: LocalIoSink,
+
+    // Used to figure out when to hook up the local input.
+    lifetime_client_count: u32,
+}
+
+impl<'a> TcpRouter<'a> {
+    pub fn new(args: &'a NcArgs) -> TcpRouter<'a> {
+        let (net_collector_sink, inbound_net_traffic_stream) = mpsc::unbounded();
+
+        // This funny syntax is required to coerce a function pointer to the fn type required by the field on the struct
+        let net_collector_sink = net_collector_sink.sink_map_err(
+            map_unbounded_sink_err_to_io_err as fn(mpsc::SendError) -> std::io::Error,
+        );
+
+        TcpRouter {
+            args,
+            routes: HashMap::new(),
+            net_collector_sink,
+            inbound_net_traffic_stream,
+            local_io_stream: Box::pin(futures::stream::pending()),
+            local_io_sink: Box::pin(
+                futures::sink::drain().sink_map_err(map_drain_sink_err_to_io_err),
+            ),
+            lifetime_client_count: 0,
         }
     }
-}
 
-// Represents the status of the input stream to the program, whether it's still open or has been closed.
-enum LocalInputStatus {
-    StillOpen,
-    Closed,
+    // Callers use this to add a new destination to the router for forwarding. It provides back a sink that the caller
+    // can use to pass in data from the network, and a stream of data that should be sent to the destination.
+    pub fn add_route(&mut self, route_addr: SocketAddr) -> RouteSinkAndStream {
+        // TODO: It would be great to take the socket sink directly and return the router sink, and eliminate this
+        // internal channel, but that makes me take the TcpStream internally, and I can't figure out how to make the
+        // lifetimes work.
+        let (collector_to_net_sink, router_to_net_stream) = mpsc::unbounded();
+
+        let collector_to_net_sink =
+            collector_to_net_sink.sink_map_err(map_unbounded_sink_err_to_io_err);
+        let router_to_net_stream = router_to_net_stream.map(Ok);
+
+        // Store the sink where the router will send data that should go to this destination. The output end of the
+        // stream is given back to the caller so they can pull data from it and send it to the actual socket.
+        self.routes
+            .insert(route_addr, Box::pin(collector_to_net_sink));
+
+        // Don't add the local IO hookup until the first client is added, otherwise the router will pull all the data
+        // out of, say, a redirected input stream, and forward it to nobody, because there are no other clients.
+        self.lifetime_client_count += 1;
+        if self.lifetime_client_count == 1 {
+            (self.local_io_sink, self.local_io_stream) = setup_local_io(self.args);
+        }
+
+        // The input end of the router (`net_collector_sink`) can be cloned to allow multiple callers to pass data into
+        // the same channel.
+        (
+            Box::pin(self.net_collector_sink.clone()),
+            Box::pin(router_to_net_stream),
+        )
+    }
+
+    // Start asynchronously processing data from all managed sockets.
+    pub async fn service(&mut self) -> std::io::Result<()> {
+        // Since there is only one local input and output (i.e. stdin/stdout), don't create a new channel to add it to
+        // the router. Instead just feed data into the router directly by tagging it as originating from the local
+        // input.
+        let mut local_io_to_router_sink = Box::pin(
+            self.net_collector_sink
+                .clone()
+                .with(|b| async { SourcedBytes::ok_from_local(b) }),
+        );
+
+        // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
+        let mut local_io_sink_opt = Some(&mut self.local_io_sink);
+
+        // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
+        // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
+        // and then restarted.
+        //
+        // Well, I haven't done a thorough check as to the guarantees each future has around cancelation and
+        // restarting, but eh it seems to work OK.
+        //
+        // There's another loop just like this in `handle_udp_sockets`.
+        loop {
+            futures::select! {
+                // Service all incoming traffic from all sockets.
+                sb = self.inbound_net_traffic_stream.select_next_some() => {
+                    if self.args.verbose {
+                        eprintln!("Router handling traffic: {:?}", sb);
+                    }
+
+                    // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should
+                    // go to. Track any failed sends so they can be pruned from the list of known routes after.
+                    let mut broken_routes = vec![];
+                    for (dest_addr, dest_sink) in self.routes.iter_mut() {
+                        if !should_forward_to(self.args, &sb.peer, dest_addr) {
+                            continue;
+                        }
+
+                        if self.args.verbose {
+                            eprintln!("Forwarding to {}", dest_addr);
+                        }
+
+                        // It could be possible to omit the peer address for the TcpRouter, because the peer address is
+                        // implicit with the socket, but I'm going to keep it this way for symmetry for now, until it
+                        // becomes a perf problem.
+                        if let Err(e) = dest_sink.send((sb.data.clone(), *dest_addr)).await {
+                            eprintln!("Error forwarding to {}. {}", dest_addr, e);
+                            broken_routes.push(*dest_addr);
+                        }
+                    }
+
+                    // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
+                    if sb.peer != LOCAL_IO_PEER_ADDR {
+                        if let Some(ref mut local_io_sink) = local_io_sink_opt {
+                            // If we hit an error emitting output, clear out the local output sink so we don't bother
+                            // trying to output more.
+                            if let Err(e) = local_io_sink.send(sb.data.clone()).await {
+                                eprintln!("Local output closed. {}", e);
+                                local_io_sink_opt = None;
+                            }
+                        }
+                    }
+
+                    // If there were any failed sends, clear them out so we don't try to send to them in the future,
+                    // which would just result in more errors.
+                    if !broken_routes.is_empty() {
+                        for pa in broken_routes.iter() {
+                            self.routes.remove(pa).unwrap();
+                        }
+                    }
+                },
+
+                // Send in all data from the local input to the router.
+                _result = local_io_to_router_sink.send_all(&mut self.local_io_stream).fuse() => {
+                    eprintln!("End of outbound data from local machine reached.");
+                    self.local_io_stream = Box::pin(futures::stream::pending());
+                },
+            }
+        }
+    }
 }
 
 // Convenience method for formatting an io::Error to String.
@@ -61,8 +319,42 @@ fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
 }
 
+// When sending data from a socket to the local output, remove the destination, to match the format that LocalIoSink
+// requires.
+async fn fut_remove_target_addr(input: TargetedBytes) -> std::io::Result<Bytes> {
+    Ok(input.0)
+}
+
+// All mpsc::UnboundedSenders use a different error type than the std::io::Error that we use everywhere else in the
+// program. This function makes the conversion.
+fn map_unbounded_sink_err_to_io_err(err: mpsc::SendError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("UnboundedSender tx failed! {}", err),
+    )
+}
+
+// In a few places we temporarily use a Drain, which never fails, but we need to switch the error type to match what is
+// used elsewhere in the program.
+fn map_drain_sink_err_to_io_err(_err: std::convert::Infallible) -> std::io::Error {
+    panic!("Drain failed somehow!");
+}
+
+// For iterators, we shouldn't yield items as quickly as possible, or else the runtime sometimes doesn't give enough
+// processing time to other tasks. This creates a stream out of an iterator but also makes sure to yield after every
+// element to make sure it can flow through the rest of the system.
+fn local_io_stream_from_iter<'a, TIter>(iter: TIter) -> LocalIoStream<'a>
+where
+    TIter: Iterator<Item = std::io::Result<Bytes>> + 'a,
+{
+    Box::pin(futures::stream::iter(iter).then(|e| async move {
+        tokio::task::yield_now().await;
+        e
+    }))
+}
+
 // Setup an output sink that either goes to stdout or to the void, depending on the user's selection.
-fn setup_local_output(args: &NcArgs) -> RemoteToLocalSink {
+fn setup_local_output(args: &NcArgs) -> LocalIoSink {
     let codec = BytesCodec::new();
     match args.output_mode {
         OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
@@ -74,12 +366,12 @@ fn setup_local_output(args: &NcArgs) -> RemoteToLocalSink {
 // the socket (not stdin) close, we can't cancel the read on stdin. The user has to hit enter to make the read call
 // finish, and then the next read won't be started.
 //
-// This isn't very nice for interactive uses. Instead, this thread uses a separate thread for the blocking stdin read.
+// This isn't very nice for interactive uses. Instead, we can set up a separate thread for the blocking stdin read.
 // If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
 fn setup_async_stdin_reader_thread(
     chunk_size: u32,
     input_mode: InputMode,
-) -> mpsc::UnboundedReceiver<std::io::Result<bytes::Bytes>> {
+) -> mpsc::UnboundedReceiver<std::io::Result<Bytes>> {
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
@@ -148,8 +440,8 @@ fn setup_async_stdin_reader_thread(
                             // Stop borrowing read_buf for a hot second so it can be sent.
                             available_buf = &mut [];
 
-                            if let Err(_) = tx_input
-                                .unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf)))
+                            if let Err(_) =
+                                tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
                             {
                                 break;
                             }
@@ -174,7 +466,7 @@ fn setup_async_stdin_reader_thread(
                     // We've accumulated a full chunk, so send it now.
                     if num_bytes_read == available_buf.len() {
                         if let Err(_) =
-                            tx_input.unbounded_send(Ok(bytes::Bytes::copy_from_slice(&read_buf)))
+                            tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
                         {
                             break;
                         }
@@ -194,43 +486,6 @@ fn setup_async_stdin_reader_thread(
     rx_input
 }
 
-// Set up a stream and sink that just echoes the stream back into the sink. The caller writes data from the network to
-// the sink, and that passes through the mpsc channel and is read by the stream, which the caller sends to the network.
-fn setup_echo_channel(args: &NcArgs) -> LocalIoStreamAndSink {
-    // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
-    let (remote_to_local_sink, local_stream_to_remote) = mpsc::unbounded();
-
-    // Transform Bytes into Result<Bytes> and optionally also echo to stdout. Need to specify the boxed dynamic type
-    // here because the match arms have different concrete types.
-    let local_stream_to_remote: LocalStreamToRemote = match args.output_mode {
-        OutputMode::Stdout => {
-            let mut stdout = std::io::stdout();
-            Box::pin(
-                local_stream_to_remote
-                    .inspect(move |e: &bytes::Bytes| {
-                        let _ = stdout.write_all(&e);
-                        let _ = stdout.flush();
-                    })
-                    .map(Ok),
-            )
-        }
-        OutputMode::Null => {
-            // Transform Bytes into Result<Bytes>.
-            Box::pin(local_stream_to_remote.map(Ok))
-        }
-    };
-
-    // Transform SendError into std::io::Error.
-    let remote_to_local_sink = Box::pin(remote_to_local_sink.sink_map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            format!("Echo tx failed! {}", e),
-        )
-    }));
-
-    (local_stream_to_remote, remote_to_local_sink)
-}
-
 // An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
 // Result<Bytes> to fit the way it is used to produce a stream of Bytes.
 struct RandBytesIter<'a, TDist>
@@ -239,7 +494,7 @@ where
 {
     args: &'a NcArgs,
 
-    // TODO: Would rather make this a template type or impl that satisfies Iterator<Item = u8> but don't know how to
+    // TODO: Would rather make this a template type or impl that satisfies Iterator<Item = u8>, but I don't know how to
     // express that.
     rand_iter: rand::distributions::DistIter<TDist, rand::rngs::ThreadRng, u8>,
     rng: rand::rngs::ThreadRng,
@@ -266,7 +521,7 @@ impl<'a, TDist> Iterator for RandBytesIter<'a, TDist>
 where
     TDist: rand::distributions::Distribution<u8>,
 {
-    type Item = std::io::Result<bytes::Bytes>;
+    type Item = std::io::Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Figure out the next random size of the chunk.
@@ -281,22 +536,19 @@ where
 
         // Generate a Bytes that contains that portion of the data. For now this is an allocation.
         // TODO: can we get rid of this allocation?
-        Some(Ok(bytes::Bytes::copy_from_slice(
+        Some(Ok(Bytes::copy_from_slice(
             &self.chunk_storage[0..next_size],
         )))
     }
 }
 
-fn setup_random_io(args: &NcArgs) -> LocalIoStreamAndSink {
+fn setup_random_io(args: &NcArgs) -> LocalIoSinkAndStream {
     // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here because
     // the match arms have different concrete types (different Distribution implementations).
-    let rng_iter: LocalStreamToRemote = match args.rand_config.vals {
+    let rng_iter: LocalIoStream = match args.rand_config.vals {
         RandValueType::Binary => {
             // Use a standard distribution across all u8 values.
-            Box::pin(futures::stream::iter(RandBytesIter::new(
-                args,
-                rand::distributions::Standard,
-            )))
+            local_io_stream_from_iter(RandBytesIter::new(args, rand::distributions::Standard))
         }
         RandValueType::Ascii => {
             // Make a distribution that references only ASCII characters. Slice returns a reference to the element in the
@@ -304,65 +556,39 @@ fn setup_random_io(args: &NcArgs) -> LocalIoStreamAndSink {
             let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
                 .unwrap()
                 .map(|e| *e);
-            Box::pin(futures::stream::iter(RandBytesIter::new(args, ascii_dist)))
+
+            local_io_stream_from_iter(RandBytesIter::new(args, ascii_dist))
         }
     };
 
-    (rng_iter, setup_local_output(args))
+    (setup_local_output(args), rng_iter)
 }
 
-fn setup_local_io(sendbuf_size: u32, args: &NcArgs) -> LocalIoStreamAndSink {
+fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
+    // When using TCP, read a byte at a time to send as fast as possible. When using UDP, use the user's requested size
+    // to produce datagrams of the correct size.
+    let chunk_size = if args.is_udp { args.sendbuf_size } else { 1 };
+
     match args.input_mode {
         InputMode::Null => (
-            Box::pin(futures::stream::pending()),
             setup_local_output(args),
+            Box::pin(futures::stream::pending()),
         ),
         InputMode::Stdin | InputMode::StdinNoCharMode => {
             (
-                // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
-                Box::pin(setup_async_stdin_reader_thread(
-                    sendbuf_size,
-                    args.input_mode,
-                )),
                 setup_local_output(args),
+                // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
+                Box::pin(setup_async_stdin_reader_thread(chunk_size, args.input_mode)),
             )
         }
-        InputMode::Echo => setup_echo_channel(args),
+
+        // Echo mode doesn't have a stream that produces data for sending. That will come directly from the sockets that
+        // send data to this machine. It's handled in the routing code.
+        InputMode::Echo => (
+            setup_local_output(args),
+            Box::pin(futures::stream::pending()),
+        ),
         InputMode::Random => setup_random_io(args),
-    }
-}
-
-// Send bytes from the local machine's input to the destination, and send incoming bytes to the local output. If any
-// error occurs, bail out. It most likely means the remote side was closed. The local input ending is not an error.
-async fn service_local_io_and_net<F1, F2>(
-    local_input_to_net: F1,
-    net_to_local_output: F2,
-) -> Option<std::io::Result<()>>
-where
-    F1: futures::Future<Output = std::io::Result<LocalInputStatus>>,
-    F2: futures::Future<Output = std::io::Result<()>>,
-{
-    tokio::select! {
-        result = local_input_to_net => {
-            match result {
-                Ok(LocalInputStatus::StillOpen) => None,
-                Ok(LocalInputStatus::Closed) => {
-                    eprintln!("End of local input reached.");
-                    Some(Ok(()))
-                },
-
-                // and() is needed to transform into this function's output result type
-                Err(_) => Some(result.and(Ok(()))),
-            }
-        },
-        result = net_to_local_output => {
-            if result.is_err() {
-                Some(result)
-            } else {
-                None
-            }
-        },
-        else => Some(Ok(())),
     }
 }
 
@@ -536,6 +762,9 @@ async fn do_tcp_connect(
 
     let candidates = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await?;
 
+    let mut connections = FuturesUnordered::new();
+    let mut router = TcpRouter::new(args);
+
     let mut candidate_count = 0;
     for addr in candidates {
         // Skip incompatible candidates from what address family the user specified.
@@ -550,8 +779,18 @@ async fn do_tcp_connect(
                 if args.is_zero_io {
                     return Ok(());
                 } else {
-                    // Return after first successful connection.
-                    return handle_tcp_stream(tcp_stream, args).await;
+                    let peer_addr = tcp_stream.peer_addr().unwrap();
+
+                    // If we were able to connect to a candidate, add them to the router so they can send and receive
+                    // traffic.
+                    connections.push(handle_tcp_stream(
+                        tcp_stream,
+                        args,
+                        router.add_route(peer_addr),
+                    ));
+
+                    // Stop after first successful connection.
+                    break;
                 }
             }
             Err(e) => {
@@ -561,15 +800,38 @@ async fn do_tcp_connect(
     }
 
     if candidate_count == 0 {
-        Err(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Host not found.",
-        ))
-    } else {
-        Err(std::io::Error::new(
+        ));
+    } else if connections.is_empty() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "Failed to connect to all candidates.",
-        ))
+        ));
+    }
+
+    loop {
+        futures::select! {
+            stream_result_opt = connections.next() => {
+                match stream_result_opt {
+                    Some((result, peer_addr)) => {
+                        match result {
+                            Ok(_) => eprintln!("Connection to {} finished gracefully.", peer_addr),
+                            Err(ref e) => eprintln!("Connection to {} ended with result {}", peer_addr, e),
+                        };
+
+                        if connections.len() == 0 {
+                            return result;
+                        }
+                    }
+                    None => return Ok(()),
+                }
+            },
+            _ = router.service().fuse() => {
+                panic!("Router exited early!");
+            }
+        };
     }
 }
 
@@ -649,110 +911,141 @@ fn get_local_addrs(
 }
 
 async fn do_tcp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io::Result<()> {
-    // Map the listening addresses to a set of sockets, and bind them.
-    let mut listening_sockets = vec![];
-    for listen_addr in listen_addrs {
-        let listening_socket = if listen_addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()
-        } else {
-            tokio::net::TcpSocket::new_v6()
-        }?;
-
-        configure_socket_options(&listening_socket, listen_addr.is_ipv4(), args)?;
-        listening_socket.bind(*listen_addr)?;
-        listening_sockets.push(listening_socket);
-    }
-
-    // Listen on all the sockets.
     let mut listeners = vec![];
-    for listening_socket in listening_sockets {
-        let local_addr = listening_socket.local_addr()?;
-        eprintln!(
-            "Listening on {}, protocol TCP, family {}",
-            local_addr,
-            if local_addr.is_ipv4() { "IPv4" } else { "IPv6" }
-        );
-
-        listeners.push(listening_socket.listen(1)?);
-    }
+    let mut clients = FuturesUnordered::new();
+    let mut router = TcpRouter::new(args);
 
     loop {
-        // Try to accept connections on any of the listening sockets. Handle clients one at a time. select_all waits for
-        // the first accept to complete and cancels waiting on all the rest.
-        let (listen_result, _i, _rest) = futures::future::select_all(
-            listeners.iter().map(|listener| Box::pin(listener.accept())),
-        )
-        .await;
+        // If we ever aren't at maximum clients accepted, start listening on all the specified addresses in order to
+        // accept new clients. Only do this if we aren't currently listening.
+        if listeners.is_empty() && clients.len() != args.max_clients {
+            // Map the listening addresses to a set of sockets, bind them, and listen on them.
+            for listen_addr in listen_addrs.iter() {
+                let listening_socket = if listen_addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()
+                } else {
+                    tokio::net::TcpSocket::new_v6()
+                }?;
 
-        match listen_result {
-            Ok((stream, ref peer_addr)) => {
+                configure_socket_options(&listening_socket, listen_addr.is_ipv4(), args)?;
+                listening_socket.bind(*listen_addr)?;
+                let local_addr = listening_socket.local_addr()?;
+
                 eprintln!(
-                    "Accepted connection from {}, protocol TCP, family {}",
-                    peer_addr,
-                    if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+                    "Listening on {}, protocol TCP, family {}",
+                    local_addr,
+                    if local_addr.is_ipv4() { "IPv4" } else { "IPv6" }
                 );
 
-                // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
-                let stream_result = if args.is_zero_io {
-                    Ok(())
-                } else {
-                    handle_tcp_stream(stream, args).await
-                };
+                listeners.push(listening_socket.listen(1)?);
+            }
+        } else if !listeners.is_empty() && clients.len() == args.max_clients {
+            eprintln!(
+                "Not accepting further clients (max {}). Closing listening sockets.",
+                args.max_clients
+            );
 
-                // After handling a client, either loop and accept another client or exit.
-                if !args.is_listening_repeatedly {
-                    return stream_result;
-                } else {
-                    match stream_result {
-                        Ok(_) => eprintln!("Connection from {} closed gracefully.", peer_addr),
-                        Err(e) => {
-                            eprintln!("Connection from {} closed with result: {}", peer_addr, e)
+            // Removing the listening sockets stops the machine from allowing the connection. Remote machines that try
+            // to connect to this machine will see a TCP timeout on the connect, which is what we want.
+            listeners.clear();
+        }
+
+        // Try accepting on all listening sockets. The future will complete when any accept goes through.
+        let mut accepts = listeners
+            .iter()
+            .map(|listener| listener.accept())
+            .collect::<FuturesUnordered<_>>();
+
+        futures::select! {
+            accept_result = accepts.select_next_some() => {
+                match accept_result {
+                    Ok((stream, ref peer_addr)) => {
+                        eprintln!(
+                            "Accepted connection from {}, protocol TCP, family {}",
+                            peer_addr,
+                            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+                        );
+
+                        // Track the accepted TCP socket here. This future will complete when the socket disconnects.
+                        // At the same time, make it known to the router so it can service traffic to and from it.
+                        clients.push(handle_tcp_stream(stream, args, router.add_route(*peer_addr)));
+                    }
+                    Err(e) => {
+                        // If there was an error accepting a connection, bail out if the user asked to listen only once.
+                        if !args.is_listening_repeatedly {
+                            eprintln!("Failed to accept an incoming connection. {}", e);
+                            return Err(e);
+                        } else {
+                            eprintln!("Failed to accept connection: {}", e);
                         }
                     }
                 }
-            }
-            Err(e) => {
+            },
+            (stream_result, peer_addr) = clients.select_next_some() => {
+                match stream_result {
+                    Ok(_) => {
+                        eprintln!("Connection from {} closed gracefully.", peer_addr);
+                    }
+                    Err(ref e) => {
+                        eprintln!("Connection from {} closed with result: {}", peer_addr, e)
+                    }
+                };
+
+                // After handling a client, either loop and accept another client or exit, depending on the user's
+                // choice.
                 if !args.is_listening_repeatedly {
-                    return Err(e);
-                } else {
-                    eprintln!("Failed to accept connection: {}", e);
+                    return stream_result;
                 }
-            }
-        }
+            },
+            _ = router.service().fuse() => {
+                panic!("Router exited early!");
+            },
+        };
     }
 }
 
 async fn handle_tcp_stream(
     mut tcp_stream: tokio::net::TcpStream,
     args: &NcArgs,
-) -> std::io::Result<()> {
+    router_io: RouteSinkAndStream,
+) -> (std::io::Result<()>, SocketAddr) {
+    let peer_addr = tcp_stream.peer_addr().unwrap();
+
+    // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
+    if args.is_zero_io {
+        return (Ok(()), peer_addr);
+    }
+
+    // The sink is the place where this function can send data coming from the network. The stream is data from the
+    // router that should be sent to the network.
+    let (mut net_to_router_sink, mut router_to_net_stream) = router_io;
+
     let (rx_socket, tx_socket) = tcp_stream.split();
 
-    let (mut data_from_local, mut data_to_local) = setup_local_io(1, args);
+    // Set up a sink that sends data out of the TCP socket. This data will come from the router, which gives
+    // TargetedBytes, so use fut_remove_target_addr to convert it to just Bytes, which is what the BytesCodec needs.
+    let mut router_to_net_sink =
+        Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()).with(fut_remove_target_addr));
 
-    // Set up a sink that ends up sending out of the TCP socket. Local data can be streamed straight into it.
-    let mut local_to_net_sink = FramedWrite::new(tx_socket, BytesCodec::new());
+    // Set up a stream that produces chunks of data from the network. The sink into the router requires SourcedBytes
+    // that include the remote peer's address. Also have to convert from BytesMut (which the socket read provides) to
+    // just Bytes. If any read error occurs, bubble it up to the disconnection event.
+    let mut net_to_router_stream = FramedRead::new(rx_socket, BytesCodec::new()).map(|bm_res| {
+        // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
+        bm_res.map(|bm| SourcedBytes {
+            data: bm.freeze(),
+            peer: peer_addr,
+        })
+    });
 
-    // Set up a stream that produces chunks of data from the network. Filter map the Result<BytesMut, Error> stream into
-    // just a Bytes stream to match the data_to_local Sink. On Error, log the error and end the stream.
-    let mut net_to_local_stream =
-        FramedRead::new(rx_socket, BytesCodec::new()).filter_map(|bm| match bm {
-            //BytesMut into Bytes
-            Ok(bm) => future::ready(Some(Ok(bm.freeze()))),
-            Err(e) => {
-                eprintln!("failed to read from socket; error={}", e);
-                future::ready(None)
-            }
-        });
-
-    // End when either the socket is closed or the local IO is closed.
-    tokio::select! {
-        result = local_to_net_sink.send_all(&mut data_from_local) => {
-            eprintln!("End of outbound data from local machine reached.");
-            result
+    // End when the socket is closed. Return the final error along with the peer address that this socket was connected
+    // to, so the program can tell the user which socket closed.
+    futures::select! {
+        result = router_to_net_sink.send_all(&mut router_to_net_stream).fuse() => {
+            (result, peer_addr)
         },
-        result = data_to_local.send_all(&mut net_to_local_stream) => {
-            result
+        result = net_to_router_sink.send_all(&mut net_to_router_stream).fuse() => {
+            (result, peer_addr)
         },
     }
 }
@@ -760,14 +1053,14 @@ async fn handle_tcp_stream(
 async fn bind_udp_sockets(
     listen_addrs: &Vec<SocketAddr>,
     args: &NcArgs,
-) -> std::io::Result<Vec<UdpTrafficSocket>> {
+) -> std::io::Result<Vec<Arc<tokio::net::UdpSocket>>> {
     // Map the listening addresses to a set of sockets, and bind them.
     let mut listening_sockets = vec![];
     for listen_addr in listen_addrs {
         let socket = tokio::net::UdpSocket::bind(*listen_addr).await?;
         configure_socket_options(&socket, listen_addr.is_ipv4(), args)?;
 
-        listening_sockets.push(UdpTrafficSocket::new(socket));
+        listening_sockets.push(Arc::new(socket));
 
         eprintln!(
             "Bound UDP socket to {}, family {}",
@@ -828,10 +1121,10 @@ async fn do_udp_connection(
         assert!(sockets.len() == 1);
 
         if args.should_join_multicast_group {
-            join_multicast_group(&*(sockets[0].socket), &source_addrs[0], &addr)?;
+            join_multicast_group(&*(sockets[0]), &source_addrs[0], &addr)?;
         }
 
-        return handle_udp_sockets(sockets, Some((0, addr)), args).await;
+        return handle_udp_sockets(&sockets, Some(addr), args).await;
     }
 
     Err(std::io::Error::new(
@@ -842,125 +1135,197 @@ async fn do_udp_connection(
 
 async fn do_udp_listen(listen_addrs: &Vec<SocketAddr>, args: &NcArgs) -> std::io::Result<()> {
     let listeners = bind_udp_sockets(&listen_addrs, args).await?;
-    handle_udp_sockets(listeners, None, args).await
+    handle_udp_sockets(&listeners, None, args).await
 }
 
+// Route traffic between local machine and multiple USB peers. The way UDP sockets work, we bind to local sockets and
+// then send out of those to remote peer addresses. There is no dedicated socket object (like a TcpStream) that
+// represents a remote peer. So we have to establish a conceptual grouping of local UDP socket and remote peer address
+// to achieve the same thing.
 async fn handle_udp_sockets(
-    mut sockets: Vec<UdpTrafficSocket>,
-    first_peer: Option<(usize, SocketAddr)>,
+    sockets: &Vec<Arc<tokio::net::UdpSocket>>,
+    first_peer: Option<SocketAddr>,
     args: &NcArgs,
 ) -> std::io::Result<()> {
-    fn print_udp_assoc(socket: &tokio::net::UdpSocket, peer_addr: &SocketAddr) {
-        let local_addr = socket.local_addr().unwrap();
+    fn print_udp_assoc(peer_addr: &SocketAddr) {
         eprintln!(
-            "Associating UDP socket from {} to {}, family {}",
-            local_addr,
+            "Associating with UDP peer {}, family {}",
             peer_addr,
             if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
         );
     }
 
-    let (mut data_from_local, mut data_to_local) = setup_local_io(args.sendbuf_size, args);
+    let (router_sink, mut inbound_net_traffic_stream) = mpsc::unbounded();
+    let router_sink = router_sink.sink_map_err(map_unbounded_sink_err_to_io_err);
 
-    // Track the list of known remote peers who have sent traffic to one of our listening sockets.
+    // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
+    let mut local_io_sink_opt = None;
+
+    // Until the first peer is known, don't start pulling from local input, or else it will get consumed too early.
+    let mut local_io_stream: LocalIoStream = Box::pin(futures::stream::pending());
+
+    // Since there is only one local input and output (i.e. stdin/stdout), don't create a new channel to add it to
+    // the router. Instead just feed data into the router directly by tagging it as originating from the local
+    // input.
+    let mut local_io_to_router_sink = Box::pin(
+        router_sink
+            .clone()
+            .with(|b| async { SourcedBytes::ok_from_local(b) }),
+    );
+
+    // A collection of all inbound traffic going to the router.
+    let mut net_to_router_flows = FuturesUnordered::new();
+
+    // Collect one sink per local socket that can be used to send data out of that socket. Categorize them by IPv4 or
+    // IPv6, because the router will try to send data out of each socket to the right destination, but should only use a
+    // matching address family or else a send error will occur.
+    let mut socket_sinks_ipv4 = vec![];
+    let mut socket_sinks_ipv6 = vec![];
+    for socket in sockets.iter() {
+        // Create a sink and stream for the socket. The sink accepts Bytes and a destination address and turns that into
+        // a sendto. The stream produces a Bytes for an incoming datagram and includes the remote source address.
+        let framed = tokio_util::udp::UdpFramed::new(socket.clone(), BytesCodec::new());
+        let (socket_sink, socket_stream) = framed.split();
+        let socket_sinks = if socket.local_addr().unwrap().is_ipv4() {
+            &mut socket_sinks_ipv4
+        } else {
+            &mut socket_sinks_ipv6
+        };
+
+        socket_sinks.push(socket_sink);
+
+        // Clone before because this is moved into the async block.
+        let mut router_sink = router_sink.clone();
+
+        // Track a future that drives all traffic from the network to the router.
+        net_to_router_flows.push(async move {
+            let mut socket_stream = socket_stream.filter_map(|bm_res| match bm_res {
+                // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
+                Ok((bm, peer_addr)) => future::ready(Some(Ok(SourcedBytes {
+                    data: bm.freeze(),
+                    peer: peer_addr,
+                }))),
+                Err(e) => {
+                    // At the point we receive an error from the socket, there isn't a good way to figure out what
+                    // caused it. It might have been the whole network stack going down, or it might have been an ICMP
+                    // error response from a previous send to an endpoint that is rejecting the send. In any case, if we
+                    // return an error here, it will take down the whole local socket. It would be better to throw away
+                    // the error and allow the socket to continue working for other sends.
+                    eprintln!("Ignoring failed recv from socket; error={}", e);
+                    future::ready(None)
+                }
+            });
+
+            router_sink.send_all(&mut socket_stream).await
+        });
+    }
+
+    // Used to figure out when to hook up the local input.
+    let mut lifetime_client_count = 0;
+
+    // Track all the known remote addresses that we should route traffic to.
     let mut known_peers = std::collections::HashSet::<SocketAddr>::new();
 
-    // Track the target peer to use for send operations. The caller might pass in a first address as a target.
-    let mut next_target_peer: Option<(Arc<tokio::net::UdpSocket>, SocketAddr)> =
-        first_peer.map(|(i, peer_addr)| {
-            print_udp_assoc(&sockets[i].socket, &peer_addr);
-            (sockets[i].socket.clone(), peer_addr)
-        });
+    // For outbound UDP scenarios, the caller will pass in the first peer to send to (rather than waiting for an inbound
+    // peer to make itself known.
+    if let Some(peer) = first_peer {
+        print_udp_assoc(&peer);
+        known_peers.insert(peer);
+        lifetime_client_count += 1;
 
+        // Since we have a remote peer hooked up, start processing local IO.
+        let (local_io_sink, local_io_stream2) = setup_local_io(args);
+        local_io_stream = local_io_stream2;
+
+        assert!(local_io_sink_opt.is_none());
+        local_io_sink_opt = Some(local_io_sink);
+    }
+
+    // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
     loop {
-        // Need to make a copy of it for use in this async operation, because it's set from from the recv path.
-        let target_peer = next_target_peer.clone();
-        let local_to_net = async {
-            if let Some((tx_socket, peer_addr)) = target_peer {
-                if let Some(Ok(b)) = data_from_local.next().await {
-                    tx_socket.send_to(&b, peer_addr).await?;
-                    Ok(LocalInputStatus::StillOpen)
-                } else {
-                    Ok(LocalInputStatus::Closed)
+        futures::select! {
+            result = net_to_router_flows.select_next_some() => {
+                // The streams in this collection never return error and so should never end.
+                panic!("net_to_router_flow ended! {:?}", result);
+            },
+            sb = inbound_net_traffic_stream.select_next_some() => {
+                if args.verbose {
+                    eprintln!("Router handling traffic: {:?}", sb);
                 }
-            } else {
-                // If no destination peer is known, hang this async block, because there's nothing to do, nowhere to
-                // send outgoing traffic. After the net_to_local async block completes, a target peer will be known and
-                // this one can start doing something useful.
-                future::pending().await
-            }
-        };
 
-        let net_to_local = async {
-            // Listen for incoming UDP packets on all sockets at the same time. select_all waits for the first
-            // recv_from to complete and cancels waiting on all the rest.
-            let (listen_result, i, _) = futures::future::select_all(
-                sockets
-                    .iter_mut()
-                    .map(|listener| Box::pin(listener.socket.recv_from(&mut listener.recv_buf))),
-            )
-            .await;
+                // On every inbound packet, check if we already know about the remote peer who sent it. If not, start
+                // tracking the peer so we can forward traffic to it if needed.
+                if sb.peer != LOCAL_IO_PEER_ADDR && known_peers.insert(sb.peer) {
+                    lifetime_client_count += 1;
 
-            match listen_result {
-                Ok((rx_bytes, peer_addr)) => {
-                    let recv_buf = &sockets[i].recv_buf;
+                    print_udp_assoc(&sb.peer);
 
-                    // Set the destination peer address for outbound traffic to the first one we received data from.
-                    if next_target_peer.is_none() {
-                        print_udp_assoc(&sockets[i].socket, &peer_addr);
-                        next_target_peer = Some((sockets[i].socket.clone(), peer_addr.clone()));
+                    // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
+                    // the data out of, say, a redirected input stream, and forward it to nobody, because there are no
+                    // other clients.
+                    if lifetime_client_count == 1 && local_io_sink_opt.is_none() {
+                        let (local_io_sink, local_io_stream2) = setup_local_io(args);
+                        local_io_stream = local_io_stream2;
+                        local_io_sink_opt = Some(local_io_sink);
+                    }
+                }
+
+                // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should go
+                // to. Track any failed sends so they can be pruned from the list of known routes after.
+                let mut broken_routes = vec![];
+                for dest_addr in known_peers.iter() {
+                    if !should_forward_to(args, &sb.peer, dest_addr) {
+                        continue;
                     }
 
-                    // Only print out the first time receiving a datagram from a given peer.
-                    if known_peers.insert(peer_addr.clone()) {
-                        eprintln!(
-                            "Received UDP datagram from {}, family {}",
-                            peer_addr,
-                            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
-                        );
+                    if args.verbose {
+                        eprintln!("Forwarding to {}", dest_addr);
                     }
 
-                    // If the entire buffer filled up (which is bigger than a normal MTU) then whatever is happening is
-                    // unsupported.
-                    if rx_bytes == recv_buf.len() {
-                        eprintln!("Dropping datagram with unsupported size, larger than 2KB!");
-                        Ok(())
+                    // You can only send to a destination that uses a matching address family as the local socket.
+                    let socket_sinks = if dest_addr.is_ipv4() {
+                        &mut socket_sinks_ipv4
                     } else {
-                        // Send to local only the portion of the receive buffer that was filled by the datagram's
-                        // payload. Have to copy here because we need to pass it to the sink, and then the receive path
-                        // reuses the buffer for getting the next datagram.
-                        data_to_local
-                            .send(bytes::Bytes::copy_from_slice(&recv_buf[..rx_bytes]))
-                            .await?;
+                        &mut socket_sinks_ipv6
+                    };
 
-                        data_to_local.flush().await?;
-                        Ok(())
+                    for socket_sink in socket_sinks.iter_mut() {
+                        if let Err(e) = socket_sink.send((sb.data.clone(), *dest_addr)).await {
+                            eprintln!("broken route: {:?}", e);
+                            broken_routes.push(*dest_addr);
+                        }
                     }
                 }
-                Err(e) => {
-                    // Sometimes send failures show up in the receive path for some reason. If this happens, then
-                    // assume we got a failure from the currently selected target peer. Clear it so that it can be set
-                    // again on the next incoming datagram.
-                    next_target_peer = None;
 
-                    if !args.is_listening_repeatedly {
-                        Err(e)
-                    } else {
-                        eprintln!("Failed to receive UDP datagram: {}", e);
-                        Ok(())
+                // Came from a remote endpoint, so also send to local IO.
+                if sb.peer != LOCAL_IO_PEER_ADDR {
+                    if let Some(ref mut local_io_sink) = local_io_sink_opt {
+                        // If we hit an error emitting output, clear out the local output sink so we don't bother
+                        // trying to output more.
+                        if let Err(e) = local_io_sink.send(sb.data.clone()).await {
+                            eprintln!("Local output closed. {}", e);
+                            local_io_sink_opt = None;
+                        }
                     }
                 }
-            }
-        };
 
-        match service_local_io_and_net(local_to_net, net_to_local).await {
-            Some(res) => return res,
-            None => {}
+                // If there were any failed sends, clear them out so we don't try to send to them in the future, which
+                // would just result in more errors.
+                if !broken_routes.is_empty() {
+                    for pa in broken_routes.iter() {
+                        known_peers.remove(pa);
+                    }
+                }
+            },
+            _result = local_io_to_router_sink.send_all(&mut local_io_stream).fuse() => {
+                eprintln!("End of outbound data from local machine reached.");
+                local_io_stream = Box::pin(futures::stream::pending());
+            },
         }
     }
 }
 
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Debug)]
 #[group(required = false, multiple = false)]
 struct AfLimit {
     /// Use IPv4 only
@@ -972,7 +1337,7 @@ struct AfLimit {
     use_v6: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 enum InputMode {
     /// No input
     #[value(name = "none", alias = "no")]
@@ -994,7 +1359,7 @@ enum InputMode {
     Random,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 enum OutputMode {
     /// Output to stdout
     Stdout,
@@ -1004,7 +1369,7 @@ enum OutputMode {
     Null,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 enum RandValueType {
     /// Binary data
     #[value(name = "binary", alias = "b")]
@@ -1055,6 +1420,10 @@ pub struct NcArgs {
     #[arg(short = 'L')]
     is_listening_repeatedly: bool,
 
+    /// Max incoming clients allowed to be connected at the same time. (TCP only).
+    #[arg(short = 'm', conflicts_with = "is_udp", default_value_t = 1)]
+    max_clients: usize,
+
     /// Source address to bind to
     #[arg(short = 's')]
     source_host: Option<String>,
@@ -1063,6 +1432,10 @@ pub struct NcArgs {
     /// Port to bind to
     #[arg(short = 'p', default_value_t = 0)]
     source_port: u16,
+
+    /// Broker mode: forward traffic between connected clients
+    #[arg(long = "broker")]
+    should_broker: bool,
 
     /// Send buffer/datagram size
     #[arg(long = "sb", default_value_t = 1)]
@@ -1126,6 +1499,10 @@ pub struct NcArgs {
 
     #[command(flatten)]
     rand_config: RandConfig,
+
+    /// Emit verbose logging.
+    #[arg(short = 'v')]
+    verbose: bool,
 }
 
 fn usage(msg: &str) -> ! {
