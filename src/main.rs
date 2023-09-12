@@ -131,7 +131,6 @@ impl std::fmt::Display for ConnectionTarget {
     }
 }
 
-
 #[macro_use]
 extern crate lazy_static;
 
@@ -804,22 +803,18 @@ async fn do_tcp_connect(
 
             match tcp_connect_to_candidate(addr, source_addrs, args).await {
                 Ok(tcp_stream) => {
-                    if args.is_zero_io {
-                        return Ok(());
-                    } else {
-                        let peer_addr = tcp_stream.peer_addr().unwrap();
+                    let peer_addr = tcp_stream.peer_addr().unwrap();
 
-                        // If we were able to connect to a candidate, add them to the router so they can send and receive
-                        // traffic.
-                        connections.push(handle_tcp_stream(
-                            tcp_stream,
-                            args,
-                            router.add_route(peer_addr),
-                        ));
+                    // If we were able to connect to a candidate, add them to the router so they can send and receive
+                    // traffic.
+                    connections.push(handle_tcp_stream(
+                        tcp_stream,
+                        args,
+                        router.add_route(peer_addr),
+                    ));
 
-                        // Stop after first successful connection for this target.
-                        break;
-                    }
+                    // Stop after first successful connection for this target.
+                    break;
                 }
                 Err(e) => {
                     eprintln!("Failed to connect to {}. Error: {}", addr, e);
@@ -832,7 +827,10 @@ async fn do_tcp_connect(
         if connections.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
-                format!("Failed to connect to all candidates for {}", &target.addr_string),
+                format!(
+                    "Failed to connect to all candidates for {}",
+                    &target.addr_string
+                ),
             ));
         }
     }
@@ -842,12 +840,38 @@ async fn do_tcp_connect(
             stream_result_opt = connections.next() => {
                 match stream_result_opt {
                     Some((result, peer_addr)) => {
-                        match result {
-                            Ok(_) => eprintln!("Connection to {} finished gracefully.", peer_addr),
-                            Err(ref e) => eprintln!("Connection to {} ended with result {}", peer_addr, e),
-                        };
+                        let should_reconnect =
+                            match result {
+                                Ok(_) => {
+                                    eprintln!("Connection to {} finished gracefully.", peer_addr);
+                                    args.should_reconnect_on_graceful_close
+                                }
+                                Err(ref e) => {
+                                    eprintln!("Connection to {} ended with result {}", peer_addr, e);
+                                    args.should_reconnect_on_error
+                                }
+                            };
 
-                        if connections.len() == 0 {
+                        // When reconnecting, just do another connection and add it to the list of ongoing connections
+                        // being tracked.
+                        if should_reconnect {
+                            match tcp_connect_to_candidate(&peer_addr, source_addrs, args).await {
+                                Ok(tcp_stream) => {
+                                    // If we were able to connect to a candidate, add them to the router so they can
+                                    // send and receive traffic.
+                                    connections.push(handle_tcp_stream(
+                                        tcp_stream,
+                                        args,
+                                        router.add_route(peer_addr),
+                                    ));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to connect to {}. Error: {}", peer_addr, e);
+                                }
+                            }
+                        }
+
+                        if connections.is_empty() {
                             return result;
                         }
                     }
@@ -911,23 +935,23 @@ fn get_local_addrs(
     let mut addrs = SockAddrSet::new();
 
     if let Some(local_host) = local_host_opt {
-        addrs.insert(format!("{}:{}", local_host, local_port)
-            .parse()
-            .or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?);
+        addrs.insert(
+            format!("{}:{}", local_host, local_port)
+                .parse()
+                .or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?,
+        );
     } else {
-        addrs.insert(
-            SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::UNSPECIFIED,
-                local_port,
-            )));
+        addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            local_port,
+        )));
 
-        addrs.insert(
-            SocketAddr::V6(std::net::SocketAddrV6::new(
-                std::net::Ipv6Addr::UNSPECIFIED,
-                local_port,
-                0,
-                0,
-            )));
+        addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::UNSPECIFIED,
+            local_port,
+            0,
+            0,
+        )));
     }
 
     // If the caller specified only one address family, filter out any incompatible address families.
@@ -1180,7 +1204,10 @@ async fn do_udp_connection(
     if args.should_join_multicast_group {
         for socket in sockets.iter() {
             let local_addr = socket.local_addr().unwrap();
-            for candidate in candidates.iter().filter(|c| c.is_ipv4() == local_addr.is_ipv4()) {
+            for candidate in candidates
+                .iter()
+                .filter(|c| c.is_ipv4() == local_addr.is_ipv4())
+            {
                 join_multicast_group(&**socket, &local_addr, candidate)?;
             }
         }
@@ -1501,6 +1528,14 @@ pub struct NcArgs {
     #[arg(long = "broker")]
     should_broker: bool,
 
+    /// Should reconnect on graceful socket close.
+    #[arg(short = 'r', requires = "targets", conflicts_with = "is_udp")]
+    should_reconnect_on_graceful_close: bool,
+
+    /// Should reconnect on socket error.
+    #[arg(short = 'R', requires = "targets", conflicts_with = "is_udp")]
+    should_reconnect_on_error: bool,
+
     /// Send buffer/datagram size
     #[arg(long = "sb", default_value_t = 1)]
     sendbuf_size: u32,
@@ -1526,11 +1561,7 @@ pub struct NcArgs {
     output_mode: OutputMode,
 
     /// Join multicast group given by hostname (outbound UDP only)
-    #[arg(
-        long = "mc",
-        requires = "is_udp",
-        requires = "targets",
-    )]
+    #[arg(long = "mc", requires = "is_udp", requires = "targets")]
     should_join_multicast_group: bool,
 
     /// Disable multicast sockets seeing their own traffic
@@ -1552,7 +1583,11 @@ pub struct NcArgs {
     verbose: bool,
 
     /// Host:Port pairs to connect to
-    #[arg(value_name= "HOST:PORT", conflicts_with = "is_listening", conflicts_with = "is_listening_repeatedly")]
+    #[arg(
+        value_name = "HOST:PORT",
+        conflicts_with = "is_listening",
+        conflicts_with = "is_listening_repeatedly"
+    )]
     targets: Vec<String>,
 }
 
@@ -1598,12 +1633,7 @@ async fn main() -> Result<(), String> {
     // more than one incoming client at a time, or else why are you in broker mode? Otherwise, safely limit to just one
     // at a time.
     if args.max_clients.is_none() {
-        args.max_clients = Some(
-            if args.should_broker {
-                10
-            } else {
-                1
-            });
+        args.max_clients = Some(if args.should_broker { 10 } else { 1 });
     }
 
     let mut targets: Vec<ConnectionTarget> = vec![];
