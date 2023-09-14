@@ -1,10 +1,13 @@
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
+extern crate regex;
+
 use bytes::Bytes;
 use clap::{Args, CommandFactory, Parser, ValueEnum};
 use futures::{channel::mpsc, future, stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
 use rand::{distributions::Distribution, Rng};
+use regex::Regex;
 use std::{
     collections::HashMap,
     collections::HashSet,
@@ -66,7 +69,10 @@ const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::ne
 ));
 
 // A special route used by bytes sourced from the local machine.
-const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr { local: LOCAL_IO_PEER_ADDR, peer: LOCAL_IO_PEER_ADDR };
+const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr {
+    local: LOCAL_IO_PEER_ADDR,
+    peer: LOCAL_IO_PEER_ADDR,
+};
 
 // A buffer of bytes that carries both the remote peer that sent it to this machine and the local address it was
 // destined for. Used for figuring out which remote machines it should be forwarded to.
@@ -133,7 +139,7 @@ type RouteSinkAndStream = (NetToRouterSink, RouterToNetStream);
 
 // A grouping of connection information for a user-specified target, something passed as a command line arg. The
 // original argument value is stored as well as all the addresses that the name resolved to.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConnectionTarget {
     addr_string: String,
 
@@ -176,6 +182,8 @@ lazy_static! {
             c.is_ascii() && !c.is_control()
         }).collect()
     };
+
+    static ref TARGET_MULTIPLIER_REGEX : Regex = Regex::new(r"x(\d+)$").expect("failed to compile regex");
 }
 
 // Core logic used by the router to decide where to forward messages, generally used when not in channel mode.
@@ -222,9 +230,16 @@ impl ChannelMap {
         }
     }
 
-    fn add_route<'r>(&mut self, new_route: &RouteAddr, all_routes: impl Iterator<Item = &'r RouteAddr>) {
+    fn add_route<'r>(
+        &mut self,
+        new_route: &RouteAddr,
+        all_routes: impl Iterator<Item = &'r RouteAddr>,
+    ) {
         // Nobody should be adding a route that's already part of a channel.
-        assert!(!self.channels.iter().any(|(ra1, ra2)| *ra1 == *new_route || *ra2 == *new_route));
+        assert!(!self
+            .channels
+            .iter()
+            .any(|(ra1, ra2)| *ra1 == *new_route || *ra2 == *new_route));
 
         // Check if there is any other route to pair it with.
         for known_route_addr in all_routes {
@@ -241,13 +256,20 @@ impl ChannelMap {
                 continue;
             }
 
-            eprintln!("Creating channel between {} and {}", known_route_addr, new_route);
+            eprintln!(
+                "Creating channel between {} and {}",
+                known_route_addr, new_route
+            );
 
             // Add the channel in both "directions" so it's easy to look up when routing traffic from either remote
             // endpoint.
-            let inserted = self.channels.insert(known_route_addr.clone(), new_route.clone());
+            let inserted = self
+                .channels
+                .insert(known_route_addr.clone(), new_route.clone());
             assert!(inserted.is_none());
-            let inserted = self.channels.insert(new_route.clone(), known_route_addr.clone());
+            let inserted = self
+                .channels
+                .insert(new_route.clone(), known_route_addr.clone());
             assert!(inserted.is_none());
 
             // A given route can only be part of at most one channel, so at this point since we added it to a channel,
@@ -266,7 +288,8 @@ impl ChannelMap {
         }
 
         // Since we store the channel in both "directions", remove all channels that reference the route to be removed.
-        self.channels.retain(|ra1, ra2| route_addr != ra1 && route_addr != ra2);
+        self.channels
+            .retain(|ra1, ra2| route_addr != ra1 && route_addr != ra2);
     }
 }
 
@@ -331,7 +354,10 @@ impl<'a> TcpRouter<'a> {
     // Callers use this to add a new destination to the router for forwarding. It provides back a sink that the caller
     // can use to pass in data from the network, and a stream of data that should be sent to the destination.
     pub fn add_route(&mut self, socket: &tokio::net::TcpStream) -> RouteSinkAndStream {
-        let new_route = RouteAddr { local: socket.local_addr().unwrap(), peer: socket.peer_addr().unwrap() };
+        let new_route = RouteAddr {
+            local: socket.local_addr().unwrap(),
+            peer: socket.peer_addr().unwrap(),
+        };
 
         // TODO: It would be great to take the socket sink directly and return the router sink, and eliminate this
         // internal channel, but that makes me take the TcpStream internally, and I can't figure out how to make the
@@ -372,7 +398,11 @@ impl<'a> TcpRouter<'a> {
 
     // This is an associated function because in some codepaths I've already mutably borrowed `self`, so this accepts
     // just the parts of the object that need to be modified.
-    fn cleanup_route(route: &RouteAddr, routes: &mut HashMap<RouteAddr, RouterToNetSink>, channels: &mut ChannelMap) {
+    fn cleanup_route(
+        route: &RouteAddr,
+        routes: &mut HashMap<RouteAddr, RouterToNetSink>,
+        channels: &mut ChannelMap,
+    ) {
         let removed = routes.remove(route);
         assert!(removed.is_some());
 
@@ -957,11 +987,7 @@ async fn do_tcp_connect(
                     // If we were able to connect to a candidate, add them to the router so they can send and receive
                     // traffic.
                     let route = router.add_route(&tcp_stream);
-                    connections.push(handle_tcp_stream(
-                        tcp_stream,
-                        args,
-                        route
-                    ));
+                    connections.push(handle_tcp_stream(tcp_stream, args, route));
 
                     // Stop after first successful connection for this target.
                     break;
@@ -1351,7 +1377,10 @@ async fn do_udp_connection(
         // balancing.
         if let Some(candidate) = target.addrs.iter().filter(is_compatible_af).next() {
             for socket in sockets.iter() {
-                let route = RouteAddr { local: socket.local_addr().unwrap(), peer: *candidate };
+                let route = RouteAddr {
+                    local: socket.local_addr().unwrap(),
+                    peer: *candidate,
+                };
                 if route.local.is_ipv4() != route.peer.is_ipv4() {
                     // Skip because incompatible address family.
                     continue;
@@ -1407,7 +1436,11 @@ async fn handle_udp_sockets(
         eprintln!(
             "Associating {}, family {}",
             route_addr,
-            if route_addr.peer.is_ipv4() { "IPv4" } else { "IPv6" }
+            if route_addr.peer.is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            }
         );
     }
 
@@ -1452,7 +1485,10 @@ async fn handle_udp_sockets(
                 // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
                 Ok((bm, peer_addr)) => future::ready(Some(Ok(SourcedBytes {
                     data: bm.freeze(),
-                    route: RouteAddr { local: local_addr, peer: peer_addr },
+                    route: RouteAddr {
+                        local: local_addr,
+                        peer: peer_addr,
+                    },
                 }))),
                 Err(e) => {
                     // At the point we receive an error from the socket, there isn't a good way to figure out what
@@ -1708,7 +1744,7 @@ struct RandConfig {
 
 #[derive(clap::Parser, Clone)]
 #[command(author, version, about, long_about = None, disable_help_flag = true, override_usage =
-r#"connect outbound: nc [options] host:port [host:port ...]
+r#"connect outbound: nc [options] host:port[xMult] [host:port[xMult] ...]
        listen for inbound: nc [-l | -L] -p port [options]"#)]
 pub struct NcArgs {
     /// this cruft (--help for long help)
@@ -1801,9 +1837,9 @@ pub struct NcArgs {
     #[arg(short = 'v')]
     verbose: bool,
 
-    /// Host:Port pairs to connect to
+    /// Host:Port pairs to connect to. Can optionally add e.g. x10, to connect to that target 10 times.
     #[arg(
-        value_name = "HOST:PORT",
+        value_name = "HOST:PORT[xMULT]",
         conflicts_with = "is_listening",
         conflicts_with = "is_listening_repeatedly"
     )]
@@ -1863,9 +1899,33 @@ async fn main() -> Result<(), String> {
     if !args.targets.is_empty() {
         eprintln!("Targets:");
         for target in args.targets.iter() {
+            let mut target: &str = &target;
+            let mut multiplier = 1;
+
+            // Check and see if the user appended x123 or whatever as a multiplier at the end of the target string.
+            if let Some(captures) = TARGET_MULTIPLIER_REGEX.captures_iter(&target).next() {
+                // Capture 0 is the entire matched text, so the part from the start up to the first matched
+                // character is the "before" portion.
+                let before_match = &target[..captures.get(0).unwrap().start()];
+
+                // Get the first capture, which should be the multiplier string.
+                if let Some(multiplier_match) = captures.get(1) {
+                    // Unwrap is OK here because the regex validated that this is a number only.
+                    multiplier = multiplier_match.as_str().parse::<u32>().unwrap();
+                    target = before_match;
+                }
+            }
+
             let ct = ConnectionTarget::new(target).await.map_err(format_io_err)?;
-            eprintln!("{}", ct);
-            targets.push(ct);
+            if multiplier != 1 {
+                eprintln!("{}x {}", multiplier, ct);
+            } else {
+                eprintln!("{}", ct);
+            }
+
+            for _ in 0..multiplier {
+                targets.push(ct.clone());
+            }
         }
     }
 
