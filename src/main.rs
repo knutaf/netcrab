@@ -7,6 +7,7 @@ use futures::{channel::mpsc, future, stream::FuturesUnordered, FutureExt, SinkEx
 use rand::{distributions::Distribution, Rng};
 use std::{
     collections::HashMap,
+    collections::HashSet,
     io::{IsTerminal, Read, Write},
     net::SocketAddr,
     pin::Pin,
@@ -14,7 +15,7 @@ use std::{
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
-// Some useful general notes about Rust async progarmming that might help when reading this code here.
+// Some useful general notes about Rust async programming that might help when reading this code here.
 //
 // Many parts of the program use futures. A future is an object that contains some processing to defer eventually. It
 // can be passed around and stored, and when we want to retrieve the value it will produce, we call `await`. Another
@@ -36,6 +37,27 @@ use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 // out of it using the `next` call or by passing it to a Sink's `send_all` call. Like an iterator, you can call `map` or
 // various other methods to change the data type that is produced by the Stream.
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct RouteAddr {
+    local: SocketAddr,
+    peer: SocketAddr,
+}
+
+impl RouteAddr {
+    fn from_tcp_stream(socket: &tokio::net::TcpStream) -> Self {
+        Self {
+            local: socket.local_addr().unwrap(),
+            peer: socket.peer_addr().unwrap(),
+        }
+    }
+}
+
+impl std::fmt::Display for RouteAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}<->{}", &self.local, &self.peer)
+    }
+}
+
 // Bytes sourced from the local machine are marked with a special peer address so they can be treated similarly to
 // sockets even when it's not a real socket (and therefore doesn't have a real network address.
 const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -43,27 +65,31 @@ const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::ne
     0,
 ));
 
-// A buffer of bytes that also carries the remote peer that sent it to this machine. Used for figuring out which remote
-// machines it should be forwarded to.
+// A special route used by bytes sourced from the local machine.
+const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr { local: LOCAL_IO_PEER_ADDR, peer: LOCAL_IO_PEER_ADDR };
+
+// A buffer of bytes that carries both the remote peer that sent it to this machine and the local address it was
+// destined for. Used for figuring out which remote machines it should be forwarded to.
 #[derive(Debug)]
 struct SourcedBytes {
     data: Bytes,
-    peer: SocketAddr,
+    route: RouteAddr,
 }
 
 impl SourcedBytes {
-    // Wrap bytes that were produced by the local machine with the special local peer address that marks them as
+    // Wrap bytes that were produced by the local machine with the special local route address that marks them as
     // originating from the local machine. As a convenience, also wrap in a Result, which is what the various streams
     // and sinks need.
     fn ok_from_local(data: Bytes) -> std::io::Result<Self> {
         Ok(Self {
             data,
-            peer: LOCAL_IO_PEER_ADDR,
+            route: LOCAL_IO_ROUTE_ADDR,
         })
     }
 }
 
-type SockAddrSet = std::collections::HashSet<SocketAddr>;
+type SockAddrSet = HashSet<SocketAddr>;
+type RouteAddrSet = HashSet<RouteAddr>;
 
 // A grouping of a data buffer plus the address it should be sent to. Primarly used for UDP traffic, where the
 // `UdpFramed` sink and stream use this tuple.
@@ -96,8 +122,8 @@ type RouterToNetSink = Pin<Box<dyn futures::Sink<TargetedBytes, Error = std::io:
 type RouterToNetStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<TargetedBytes>>>>;
 
 // A sink of bytes originating from some remote peer. Each socket drives data received on it to the router using this
-// sink, supplying where the data came from. The router uses the data's origin to decide where the data should be
-// forwarded to.
+// sink, supplying where the data came from as well as the local address it arrives at. The router uses the data's
+// origin and local destination to decide where the data should be forwarded to.
 type NetToRouterSink = Pin<Box<dyn futures::Sink<SourcedBytes, Error = std::io::Error>>>;
 
 // When the program wants to add a new remote peer to the router so that the router can forward data to it, the router
@@ -105,13 +131,19 @@ type NetToRouterSink = Pin<Box<dyn futures::Sink<SourcedBytes, Error = std::io::
 // socket should send to the remote peer.
 type RouteSinkAndStream = (NetToRouterSink, RouterToNetStream);
 
+// A grouping of connection information for a user-specified target, something passed as a command line arg. The
+// original argument value is stored as well as all the addresses that the name resolved to.
 #[derive(Debug)]
 struct ConnectionTarget {
     addr_string: String,
+
+    // This is stored as a vector instead of a SockAddrSet because we want to preserve the ordering from DNS.
     addrs: Vec<SocketAddr>,
 }
 
 impl ConnectionTarget {
+    // Do a DNS resolution on an address string and make a ConnectionTarget that contains the original value and the
+    // resolved addresses.
     async fn new(addr_string: &str) -> std::io::Result<Self> {
         Ok(Self {
             addr_string: String::from(addr_string),
@@ -146,7 +178,7 @@ lazy_static! {
     };
 }
 
-// Core logic used by the router to decide where to forward messages.
+// Core logic used by the router to decide where to forward messages, generally used when not in channel mode.
 fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> bool {
     // In echo mode, allow sending data back to the source.
     if source == dest && args.input_mode != InputMode::Echo {
@@ -160,7 +192,7 @@ fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> b
     // When brokering, any incoming traffic should be sent back to all other peers.
     // When not brokering, only send to the local output or back to the source (only possible in
     // echo mode).
-    if !args.should_broker
+    if args.forwarding_mode != ForwardingMode::Broker
         && (dest != source)
         && *dest != LOCAL_IO_PEER_ADDR
         && *source != LOCAL_IO_PEER_ADDR
@@ -175,8 +207,71 @@ fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> b
     true
 }
 
+// This implements storage and lookup of "channels", which are pairs of remote peers that we should forward traffic
+// between but not cross over into other channels. Each channel consists of two routes, one for each remote peer. And
+// each route also contains the local address that receives traffic from that peer. This 4-tuple uniquely identifies the
+// path a packet takes when it arrives from one endpoint and should be forwarded to the other endpoint.
+struct ChannelMap {
+    channels: HashMap<RouteAddr, RouteAddr>,
+}
+
+impl ChannelMap {
+    fn new() -> Self {
+        Self {
+            channels: HashMap::new(),
+        }
+    }
+
+    fn add_route<'r>(&mut self, new_route: &RouteAddr, all_routes: impl Iterator<Item = &'r RouteAddr>) {
+        // Nobody should be adding a route that's already part of a channel.
+        assert!(!self.channels.iter().any(|(ra1, ra2)| *ra1 == *new_route || *ra2 == *new_route));
+
+        // Check if there is any other route to pair it with.
+        for known_route_addr in all_routes {
+            // Don't create channels between two ports on the same remote host. Channels are always between different
+            // remote hosts. A gap here is that due to NATs, two different remote hosts might appear to come from the
+            // same remote IP. A TODO would be to allow a config file or something to decide which remote peers
+            // should be permitted to pair up in a channel together.
+            if known_route_addr.peer.ip() == new_route.peer.ip() {
+                continue;
+            }
+
+            // This route is already used in a channel, so it's not available to add to a new one.
+            if self.channels.get(known_route_addr).is_some() {
+                continue;
+            }
+
+            eprintln!("Creating channel between {} and {}", known_route_addr, new_route);
+
+            // Add the channel in both "directions" so it's easy to look up when routing traffic from either remote
+            // endpoint.
+            let inserted = self.channels.insert(known_route_addr.clone(), new_route.clone());
+            assert!(inserted.is_none());
+            let inserted = self.channels.insert(new_route.clone(), known_route_addr.clone());
+            assert!(inserted.is_none());
+
+            // A given route can only be part of at most one channel, so at this point since we added it to a channel,
+            // we can stop iterating to look for one.
+            break;
+        }
+    }
+
+    fn get_dest_route(&self, route_addr: &RouteAddr) -> Option<&RouteAddr> {
+        self.channels.get(route_addr)
+    }
+
+    fn remove_route(&mut self, route_addr: &RouteAddr) {
+        if let Some(route) = self.channels.get(route_addr) {
+            eprintln!("Removing failed channel {} <-> {}", route.local, route.peer);
+        }
+
+        // Since we store the channel in both "directions", remove all channels that reference the route to be removed.
+        self.channels.retain(|ra1, ra2| route_addr != ra1 && route_addr != ra2);
+    }
+}
+
 // An object that manages a set of known peers. It accepts data from one or more sockets and forwards incoming data
-// either just to the local output or to other known peers, depending on the `should_broker` flag. The reason it is
+// either just to the local output or to other known peers, depending on the forwarding mode. The reason it is
 // specific to TCP is because the sockets that it manages have the destination address embedded in them, unlike UDP,
 // where a single socket sends to multiple destinations.
 struct TcpRouter<'a> {
@@ -184,7 +279,11 @@ struct TcpRouter<'a> {
 
     // A collection of known remote peers, indexed by the remote peer address. Each known peer has a sink that is used
     // for the router to send data to that peer.
-    routes: HashMap<SocketAddr, RouterToNetSink>,
+    routes: HashMap<RouteAddr, RouterToNetSink>,
+
+    // Storage for channels, which are associations of two remote endpoints together for forwarding to each other but
+    // not to other channels.
+    channels: ChannelMap,
 
     // A sink where all sockets send data to the router for forwarding. Normally this would just be an UnboundedSender,
     // but since we map the send error, it gets stored as a complicated type. Thanks, Rust.
@@ -218,6 +317,7 @@ impl<'a> TcpRouter<'a> {
         Self {
             args,
             routes: HashMap::new(),
+            channels: ChannelMap::new(),
             net_collector_sink,
             inbound_net_traffic_stream,
             local_io_stream: Box::pin(futures::stream::pending()),
@@ -230,7 +330,9 @@ impl<'a> TcpRouter<'a> {
 
     // Callers use this to add a new destination to the router for forwarding. It provides back a sink that the caller
     // can use to pass in data from the network, and a stream of data that should be sent to the destination.
-    pub fn add_route(&mut self, route_addr: SocketAddr) -> RouteSinkAndStream {
+    pub fn add_route(&mut self, socket: &tokio::net::TcpStream) -> RouteSinkAndStream {
+        let new_route = RouteAddr { local: socket.local_addr().unwrap(), peer: socket.peer_addr().unwrap() };
+
         // TODO: It would be great to take the socket sink directly and return the router sink, and eliminate this
         // internal channel, but that makes me take the TcpStream internally, and I can't figure out how to make the
         // lifetimes work.
@@ -243,7 +345,11 @@ impl<'a> TcpRouter<'a> {
         // Store the sink where the router will send data that should go to this destination. The output end of the
         // stream is given back to the caller so they can pull data from it and send it to the actual socket.
         self.routes
-            .insert(route_addr, Box::pin(collector_to_net_sink));
+            .insert(new_route.clone(), Box::pin(collector_to_net_sink));
+
+        if self.args.forwarding_mode == ForwardingMode::Channels {
+            self.channels.add_route(&new_route, self.routes.keys());
+        }
 
         // Don't add the local IO hookup until the first client is added, otherwise the router will pull all the data
         // out of, say, a redirected input stream, and forward it to nobody, because there are no other clients.
@@ -258,6 +364,21 @@ impl<'a> TcpRouter<'a> {
             Box::pin(self.net_collector_sink.clone()),
             Box::pin(router_to_net_stream),
         )
+    }
+
+    pub fn remove_route(&mut self, route: &RouteAddr) {
+        Self::cleanup_route(route, &mut self.routes, &mut self.channels);
+    }
+
+    // This is an associated function because in some codepaths I've already mutably borrowed `self`, so this accepts
+    // just the parts of the object that need to be modified.
+    fn cleanup_route(route: &RouteAddr, routes: &mut HashMap<RouteAddr, RouterToNetSink>, channels: &mut ChannelMap) {
+        let removed = routes.remove(route);
+        assert!(removed.is_some());
+
+        channels.remove_route(route);
+
+        // TODO: consider at this point looping through all the routes and deciding if we need to pair up new ones.
     }
 
     // Start asynchronously processing data from all managed sockets.
@@ -290,29 +411,59 @@ impl<'a> TcpRouter<'a> {
                         eprintln!("Router handling traffic: {:?}", sb);
                     }
 
-                    // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should
-                    // go to. Track any failed sends so they can be pruned from the list of known routes after.
-                    let mut broken_routes = vec![];
-                    for (dest_addr, dest_sink) in self.routes.iter_mut() {
-                        if !should_forward_to(self.args, &sb.peer, dest_addr) {
-                            continue;
-                        }
+                    let mut broken_routes = RouteAddrSet::new();
+                    let mut did_send = false;
+                    if self.args.forwarding_mode == ForwardingMode::Channels {
+                        // Look up whether this incoming route has a corresponding destination route in a channel.
+                        if let Some(channel_dest) = self.channels.get_dest_route(&sb.route) {
+                            if self.args.verbose {
+                                eprintln!("Forwarding on channel {} -> {}", sb.route, channel_dest);
+                            }
 
-                        if self.args.verbose {
-                            eprintln!("Forwarding to {}", dest_addr);
-                        }
+                            // Look up the sink to send to for this route. There always is one, so `unwrap` is OK.
+                            let dest_sink = self.routes.get_mut(channel_dest).unwrap();
 
-                        // It could be possible to omit the peer address for the TcpRouter, because the peer address is
-                        // implicit with the socket, but I'm going to keep it this way for symmetry for now, until it
-                        // becomes a perf problem.
-                        if let Err(e) = dest_sink.send((sb.data.clone(), *dest_addr)).await {
-                            eprintln!("Error forwarding to {}. {}", dest_addr, e);
-                            broken_routes.push(*dest_addr);
+                            if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest.peer)).await {
+                                eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
+                                broken_routes.insert(channel_dest.clone());
+                            }
+
+                            did_send = true;
+                        } else {
+                            if self.args.verbose {
+                                eprintln!("Dropping message from {}. No channel found.", sb.route);
+                            }
+                        }
+                    }
+
+                    // If no send happened from channels earlier, try again with regular routing. We shouldn't be in
+                    // both broker mode and channel mode, so mostly this covers making sure local input can be sent out,
+                    // since it isn't associated with any channel.
+                    if !did_send {
+                        // Broadcast any incoming data back to whichever other connected sockets and/or local IO it
+                        // should go to. Track any failed sends so they can be pruned from the list of known routes
+                        // after.
+                        for (dest_route, dest_sink) in self.routes.iter_mut() {
+                            if !should_forward_to(self.args, &sb.route.peer, &dest_route.peer) {
+                                continue;
+                            }
+
+                            if self.args.verbose {
+                                eprintln!("Forwarding to {}", dest_route.peer);
+                            }
+
+                            // It could be possible to omit the peer address for the TcpRouter, because the peer address
+                            // is implicit with the socket, but I'm going to keep it this way for symmetry for now,
+                            // until it becomes a perf problem.
+                            if let Err(e) = dest_sink.send((sb.data.clone(), dest_route.peer)).await {
+                                eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
+                                broken_routes.insert(dest_route.clone());
+                            }
                         }
                     }
 
                     // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
-                    if sb.peer != LOCAL_IO_PEER_ADDR {
+                    if sb.route.peer != LOCAL_IO_PEER_ADDR {
                         if let Some(ref mut local_io_sink) = local_io_sink_opt {
                             // If we hit an error emitting output, clear out the local output sink so we don't bother
                             // trying to output more.
@@ -326,8 +477,8 @@ impl<'a> TcpRouter<'a> {
                     // If there were any failed sends, clear them out so we don't try to send to them in the future,
                     // which would just result in more errors.
                     if !broken_routes.is_empty() {
-                        for pa in broken_routes.iter() {
-                            self.routes.remove(pa).unwrap();
+                        for route in broken_routes.iter() {
+                            Self::cleanup_route(route, &mut self.routes, &mut self.channels);
                         }
                     }
                 },
@@ -803,14 +954,13 @@ async fn do_tcp_connect(
 
             match tcp_connect_to_candidate(addr, source_addrs, args).await {
                 Ok(tcp_stream) => {
-                    let peer_addr = tcp_stream.peer_addr().unwrap();
-
                     // If we were able to connect to a candidate, add them to the router so they can send and receive
                     // traffic.
+                    let route = router.add_route(&tcp_stream);
                     connections.push(handle_tcp_stream(
                         tcp_stream,
                         args,
-                        router.add_route(peer_addr),
+                        route
                     ));
 
                     // Stop after first successful connection for this target.
@@ -838,39 +988,45 @@ async fn do_tcp_connect(
     loop {
         futures::select! {
             stream_result_opt = connections.next() => {
+                // A TcpStream ended. Print out some status and potentially reconnect to it.
                 match stream_result_opt {
-                    Some((result, peer_addr)) => {
+                    Some((result, route_addr)) => {
                         let should_reconnect =
                             match result {
                                 Ok(_) => {
-                                    eprintln!("Connection to {} finished gracefully.", peer_addr);
+                                    eprintln!("Connection {} finished gracefully.", route_addr);
                                     args.should_reconnect_on_graceful_close
                                 }
                                 Err(ref e) => {
-                                    eprintln!("Connection to {} ended with result {}", peer_addr, e);
+                                    eprintln!("Connection {} ended with result {}", route_addr, e);
                                     args.should_reconnect_on_error
                                 }
                             };
 
+                        // Notify the router that a connection failed so it can clean it up.
+                        router.remove_route(&route_addr);
+
                         // When reconnecting, just do another connection and add it to the list of ongoing connections
                         // being tracked.
                         if should_reconnect {
-                            match tcp_connect_to_candidate(&peer_addr, source_addrs, args).await {
+                            match tcp_connect_to_candidate(&route_addr.peer, source_addrs, args).await {
                                 Ok(tcp_stream) => {
                                     // If we were able to connect to a candidate, add them to the router so they can
                                     // send and receive traffic.
+                                    let route = router.add_route(&tcp_stream);
                                     connections.push(handle_tcp_stream(
                                         tcp_stream,
                                         args,
-                                        router.add_route(peer_addr),
+                                        route
                                     ));
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to connect to {}. Error: {}", peer_addr, e);
+                                    eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
                                 }
                             }
                         }
 
+                        // If at any time we have no connections left, then there's nothing else to do, so return.
                         if connections.is_empty() {
                             return result;
                         }
@@ -1023,7 +1179,8 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
 
                         // Track the accepted TCP socket here. This future will complete when the socket disconnects.
                         // At the same time, make it known to the router so it can service traffic to and from it.
-                        clients.push(handle_tcp_stream(stream, args, router.add_route(*peer_addr)));
+                        let route = router.add_route(&stream);
+                        clients.push(handle_tcp_stream(stream, args, route));
                     }
                     Err(e) => {
                         // If there was an error accepting a connection, bail out if the user asked to listen only once.
@@ -1036,13 +1193,13 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                     }
                 }
             },
-            (stream_result, peer_addr) = clients.select_next_some() => {
+            (stream_result, route_addr) = clients.select_next_some() => {
                 match stream_result {
                     Ok(_) => {
-                        eprintln!("Connection from {} closed gracefully.", peer_addr);
+                        eprintln!("Connection {} closed gracefully.", route_addr);
                     }
                     Err(ref e) => {
-                        eprintln!("Connection from {} closed with result: {}", peer_addr, e)
+                        eprintln!("Connection {} closed with result: {}", route_addr, e)
                     }
                 };
 
@@ -1051,6 +1208,9 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                 if !args.is_listening_repeatedly {
                     return stream_result;
                 }
+
+                // Notify the router that a connection failed so it can clean it up.
+                router.remove_route(&route_addr);
             },
             _ = router.service().fuse() => {
                 panic!("Router exited early!");
@@ -1063,12 +1223,12 @@ async fn handle_tcp_stream(
     mut tcp_stream: tokio::net::TcpStream,
     args: &NcArgs,
     router_io: RouteSinkAndStream,
-) -> (std::io::Result<()>, SocketAddr) {
-    let peer_addr = tcp_stream.peer_addr().unwrap();
+) -> (std::io::Result<()>, RouteAddr) {
+    let route_addr = RouteAddr::from_tcp_stream(&tcp_stream);
 
     // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
     if args.is_zero_io {
-        return (Ok(()), peer_addr);
+        return (Ok(()), route_addr);
     }
 
     // The sink is the place where this function can send data coming from the network. The stream is data from the
@@ -1089,7 +1249,7 @@ async fn handle_tcp_stream(
         // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
         bm_res.map(|bm| SourcedBytes {
             data: bm.freeze(),
-            peer: peer_addr,
+            route: route_addr.clone(),
         })
     });
 
@@ -1097,10 +1257,10 @@ async fn handle_tcp_stream(
     // to, so the program can tell the user which socket closed.
     futures::select! {
         result = router_to_net_sink.send_all(&mut router_to_net_stream).fuse() => {
-            (result, peer_addr)
+            (result, route_addr)
         },
         result = net_to_router_sink.send_all(&mut net_to_router_stream).fuse() => {
-            (result, peer_addr)
+            (result, route_addr)
         },
     }
 }
@@ -1145,34 +1305,19 @@ async fn do_udp_connection(
 ) -> std::io::Result<()> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
-    // Select one address for each candidate to use. Pick the first one of the list, because that might be the preferred
-    // choice for DNS load balancing.
-    let mut candidates = SockAddrSet::new();
+    let is_compatible_af = |addr: &&SocketAddr| {
+        !(args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4())
+    };
+
+    // Take the first address with a compatible address family to the user's preferences and track which address family
+    // is used, so we can find out which local sockets need to be bound.
     let mut has_ipv4 = false;
     let mut has_ipv6 = false;
     for target in targets.iter() {
-        for addr in target.addrs.iter() {
-            // Skip incompatible candidates from what address family the user specified.
-            if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
-                continue;
-            }
-
-            // Track whether any IPv4 or IPv6 addresses were encountered, to know which local sockets to bind.
+        if let Some(addr) = target.addrs.iter().filter(is_compatible_af).next() {
             has_ipv4 |= addr.is_ipv4();
             has_ipv6 |= addr.is_ipv6();
-
-            candidates.insert(*addr);
-
-            // Only use the first address for each target.
-            break;
         }
-    }
-
-    if candidates.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "No suitable remote peers found.",
-        ));
     }
 
     // Filter the source address list to only ones that match the address families of any candidates being used.
@@ -1199,6 +1344,34 @@ async fn do_udp_connection(
 
     assert!(!sockets.is_empty());
 
+    let mut candidates = RouteAddrSet::new();
+    for target in targets.iter() {
+        // Select only one address for each target to use, so we don't send duplicate traffic to two addresses from the
+        // same machine. Pick the first one of the list, because that might be the preferred choice for DNS load
+        // balancing.
+        if let Some(candidate) = target.addrs.iter().filter(is_compatible_af).next() {
+            for socket in sockets.iter() {
+                let route = RouteAddr { local: socket.local_addr().unwrap(), peer: *candidate };
+                if route.local.is_ipv4() != route.peer.is_ipv4() {
+                    // Skip because incompatible address family.
+                    continue;
+                }
+
+                candidates.insert(route);
+
+                // Choose the first socket with a matching address family to use to send to the peer.
+                break;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "No suitable remote peers found.",
+        ));
+    }
+
     // If joining multicast, then try to have each source address join each multicast group of a matching address
     // family.
     if args.should_join_multicast_group {
@@ -1206,9 +1379,9 @@ async fn do_udp_connection(
             let local_addr = socket.local_addr().unwrap();
             for candidate in candidates
                 .iter()
-                .filter(|c| c.is_ipv4() == local_addr.is_ipv4())
+                .filter(|c| c.local.is_ipv4() == local_addr.is_ipv4())
             {
-                join_multicast_group(&**socket, &local_addr, candidate)?;
+                join_multicast_group(&**socket, &local_addr, &candidate.peer)?;
             }
         }
     }
@@ -1221,20 +1394,20 @@ async fn do_udp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
     handle_udp_sockets(&listeners, None, args).await
 }
 
-// Route traffic between local machine and multiple USB peers. The way UDP sockets work, we bind to local sockets and
+// Route traffic between local machine and multiple UDP peers. The way UDP sockets work, we bind to local sockets and
 // then send out of those to remote peer addresses. There is no dedicated socket object (like a TcpStream) that
 // represents a remote peer. So we have to establish a conceptual grouping of local UDP socket and remote peer address
 // to achieve the same thing.
 async fn handle_udp_sockets(
     sockets: &Vec<Arc<tokio::net::UdpSocket>>,
-    initial_peers_opt: Option<&SockAddrSet>,
+    initial_routes_opt: Option<&RouteAddrSet>,
     args: &NcArgs,
 ) -> std::io::Result<()> {
-    fn print_udp_assoc(peer_addr: &SocketAddr) {
+    fn print_udp_assoc(route_addr: &RouteAddr) {
         eprintln!(
-            "Associating with UDP peer {}, family {}",
-            peer_addr,
-            if peer_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            "Associating {}, family {}",
+            route_addr,
+            if route_addr.peer.is_ipv4() { "IPv4" } else { "IPv6" }
         );
     }
 
@@ -1259,23 +1432,16 @@ async fn handle_udp_sockets(
     // A collection of all inbound traffic going to the router.
     let mut net_to_router_flows = FuturesUnordered::new();
 
-    // Collect one sink per local socket that can be used to send data out of that socket. Categorize them by IPv4 or
-    // IPv6, because the router will try to send data out of each socket to the right destination, but should only use a
-    // matching address family or else a send error will occur.
-    let mut socket_sinks_ipv4 = vec![];
-    let mut socket_sinks_ipv6 = vec![];
+    // Collect one sink per local socket address that can be used to send data out of that socket.
+    let mut socket_sinks = HashMap::new();
     for socket in sockets.iter() {
         // Create a sink and stream for the socket. The sink accepts Bytes and a destination address and turns that into
         // a sendto. The stream produces a Bytes for an incoming datagram and includes the remote source address.
+        let local_addr = socket.local_addr().unwrap();
         let framed = tokio_util::udp::UdpFramed::new(socket.clone(), BytesCodec::new());
         let (socket_sink, socket_stream) = framed.split();
-        let socket_sinks = if socket.local_addr().unwrap().is_ipv4() {
-            &mut socket_sinks_ipv4
-        } else {
-            &mut socket_sinks_ipv6
-        };
 
-        socket_sinks.push(socket_sink);
+        socket_sinks.insert(local_addr, socket_sink);
 
         // Clone before because this is moved into the async block.
         let mut router_sink = router_sink.clone();
@@ -1286,7 +1452,7 @@ async fn handle_udp_sockets(
                 // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
                 Ok((bm, peer_addr)) => future::ready(Some(Ok(SourcedBytes {
                     data: bm.freeze(),
-                    peer: peer_addr,
+                    route: RouteAddr { local: local_addr, peer: peer_addr },
                 }))),
                 Err(e) => {
                     // At the point we receive an error from the socket, there isn't a good way to figure out what
@@ -1306,17 +1472,25 @@ async fn handle_udp_sockets(
     // Used to figure out when to hook up the local input.
     let mut lifetime_client_count = 0;
 
-    // Track all the known remote addresses that we should route traffic to.
-    let mut known_peers = SockAddrSet::new();
+    // All known local<->remote endpoints we know about. If someone sends us traffic to one of our local addresses,
+    // track it so we know which local socket to use to send replies.
+    let mut known_routes = HashSet::new();
 
-    // For outbound UDP scenarios, the caller will pass in the first set of peers to send to (rather than waiting for an
-    // inbound peer to make itself known.
-    if let Some(initial_peers) = initial_peers_opt {
-        for peer in initial_peers.iter() {
-            print_udp_assoc(&peer);
-            let added = known_peers.insert(*peer);
+    let mut channels = ChannelMap::new();
+
+    // For outbound UDP scenarios, the caller will pass in the first set of routes--remote peers and which local socket
+    // to use to send to that peer. For inbound scenarios, the remote peers aren't known until they send traffic here
+    // first.
+    if let Some(initial_routes) = initial_routes_opt {
+        for route in initial_routes.iter() {
+            print_udp_assoc(&route);
+            let added = known_routes.insert(route.clone());
             assert!(added);
             lifetime_client_count += 1;
+
+            if args.forwarding_mode == ForwardingMode::Channels {
+                channels.add_route(route, known_routes.iter());
+            }
 
             if lifetime_client_count == 1 {
                 // Since we have a remote peer hooked up, start processing local IO.
@@ -1346,10 +1520,14 @@ async fn handle_udp_sockets(
                 //
                 // If joining a multicast group, don't do this, because it'll end up adding duplicate peers who were
                 // going to receive traffic from the multicast group anyway.
-                if !args.should_join_multicast_group && sb.peer != LOCAL_IO_PEER_ADDR && known_peers.insert(sb.peer) {
+                if !args.should_join_multicast_group && sb.route.peer != LOCAL_IO_PEER_ADDR && known_routes.insert(sb.route.clone()) {
                     lifetime_client_count += 1;
 
-                    print_udp_assoc(&sb.peer);
+                    print_udp_assoc(&sb.route);
+
+                    if args.forwarding_mode == ForwardingMode::Channels {
+                        channels.add_route(&sb.route, known_routes.iter());
+                    }
 
                     // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
                     // the data out of, say, a redirected input stream, and forward it to nobody, because there are no
@@ -1361,35 +1539,60 @@ async fn handle_udp_sockets(
                     }
                 }
 
+                let mut broken_routes = RouteAddrSet::new();
+                let mut did_send = false;
+
+                // If using channel routing, look up if there's a known channel that this incoming packet should be
+                // forwarded to.
+                if args.forwarding_mode == ForwardingMode::Channels {
+                    if let Some(channel_dest) = channels.get_dest_route(&sb.route) {
+                        if args.verbose {
+                            eprintln!("Forwarding on channel {} -> {}", sb.route, channel_dest);
+                        }
+
+                        // There should always be a backing sink for any channel route.
+                        let dest_sink = socket_sinks.get_mut(&channel_dest.local).unwrap();
+
+                        if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest.peer)).await {
+                            eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
+                            broken_routes.insert(channel_dest.clone());
+                        }
+
+                        did_send = true;
+                    } else {
+                        if args.verbose {
+                            eprintln!("Dropping message from {}. No channel found.", sb.route);
+                        }
+                    }
+                }
+
+                // If no send happened from channels earlier, try again with regular routing. We shouldn't be in both
+                // broker mode and channel mode, so mostly this covers making sure local input can be sent out, since
+                // it isn't associated with any channel.
+                //
                 // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should go
                 // to. Track any failed sends so they can be pruned from the list of known routes after.
-                let mut broken_routes = SockAddrSet::new();
-                for dest_addr in known_peers.iter() {
-                    if !should_forward_to(args, &sb.peer, dest_addr) {
-                        continue;
-                    }
+                if !did_send {
+                    for dest_route in known_routes.iter() {
+                        if !should_forward_to(args, &sb.route.peer, &dest_route.peer) {
+                            continue;
+                        }
 
-                    if args.verbose {
-                        eprintln!("Forwarding to {}", dest_addr);
-                    }
+                        if args.verbose {
+                            eprintln!("Forwarding to {}", dest_route.peer);
+                        }
 
-                    // You can only send to a destination that uses a matching address family as the local socket.
-                    let socket_sinks = if dest_addr.is_ipv4() {
-                        &mut socket_sinks_ipv4
-                    } else {
-                        &mut socket_sinks_ipv6
-                    };
-
-                    for socket_sink in socket_sinks.iter_mut() {
-                        if let Err(e) = socket_sink.send((sb.data.clone(), *dest_addr)).await {
-                            eprintln!("broken route: {:?}", e);
-                            broken_routes.insert(*dest_addr);
+                        if let Some(socket_sink) = socket_sinks.get_mut(&dest_route.local) {
+                            if let Err(e) = socket_sink.send((sb.data.clone(), dest_route.peer)).await {
+                                eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
+                                broken_routes.insert(dest_route.clone());
+                            }
                         }
                     }
                 }
 
                 // Came from a remote endpoint, so also send to local IO.
-                if sb.peer != LOCAL_IO_PEER_ADDR {
+                if sb.route.peer != LOCAL_IO_PEER_ADDR {
                     if let Some(ref mut local_io_sink) = local_io_sink_opt {
                         // If we hit an error emitting output, clear out the local output sink so we don't bother
                         // trying to output more.
@@ -1403,8 +1606,9 @@ async fn handle_udp_sockets(
                 // If there were any failed sends, clear them out so we don't try to send to them in the future, which
                 // would just result in more errors.
                 if !broken_routes.is_empty() {
-                    for pa in broken_routes.iter() {
-                        known_peers.remove(pa);
+                    for route in broken_routes.iter() {
+                        known_routes.remove(route);
+                        channels.remove_route(route);
                     }
                 }
             },
@@ -1458,6 +1662,21 @@ enum OutputMode {
     /// No output
     #[value(name = "none", alias = "no")]
     Null,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
+enum ForwardingMode {
+    /// No forwarding
+    #[value(name = "none")]
+    Null,
+
+    /// Broker mode: forward traffic between connected clients. Automatically sets -m 10.
+    #[value(name = "broker", alias = "b")]
+    Broker,
+
+    /// Channel mode: automatically group pairs of remote addresses from different IP addresses into "channels" and forward traffic between the two endpoints, but not between different channels. Automatically sets -m 10.
+    #[value(name = "channels", alias = "c")]
+    Channels,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
@@ -1524,9 +1743,9 @@ pub struct NcArgs {
     #[arg(short = 'p', default_value_t = 0)]
     source_port: u16,
 
-    /// Broker mode: forward traffic between connected clients. Automatically sets -m 128.
-    #[arg(long = "broker")]
-    should_broker: bool,
+    /// Forwarding mode
+    #[arg(short = 'f', long = "fm", value_enum, default_value_t = ForwardingMode::Null)]
+    forwarding_mode: ForwardingMode,
 
     /// Should reconnect on graceful socket close.
     #[arg(short = 'r', requires = "targets", conflicts_with = "is_udp")]
@@ -1629,11 +1848,14 @@ async fn main() -> Result<(), String> {
         _ => {}
     }
 
-    // If max_clients wasn't specified explicitly, set its value automatically. If in broker mode, you generally want
-    // more than one incoming client at a time, or else why are you in broker mode? Otherwise, safely limit to just one
-    // at a time.
+    // If max_clients wasn't specified explicitly, set its value automatically. If in broker or channel mode, you
+    // generally want more than one incoming client at a time, or else why are you in a forwarding mode?? Otherwise,
+    // safely limit to just one at a time.
     if args.max_clients.is_none() {
-        args.max_clients = Some(if args.should_broker { 10 } else { 1 });
+        args.max_clients = Some(match args.forwarding_mode {
+            ForwardingMode::Null => 1,
+            ForwardingMode::Broker | ForwardingMode::Channels => 10,
+        });
     }
 
     let mut targets: Vec<ConnectionTarget> = vec![];
