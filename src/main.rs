@@ -373,7 +373,7 @@ impl<'a> TcpRouter<'a> {
         self.routes
             .insert(new_route.clone(), Box::pin(collector_to_net_sink));
 
-        if self.args.forwarding_mode == ForwardingMode::Channels {
+        if self.args.is_using_channels() {
             self.channels.add_route(&new_route, self.routes.keys());
         }
 
@@ -393,18 +393,40 @@ impl<'a> TcpRouter<'a> {
     }
 
     pub fn remove_route(&mut self, route: &RouteAddr) {
-        Self::cleanup_route(route, &mut self.routes, &mut self.channels);
+        Self::cleanup_route(route, self.args, &mut self.routes, &mut self.channels);
     }
 
     // This is an associated function because in some codepaths I've already mutably borrowed `self`, so this accepts
     // just the parts of the object that need to be modified.
     fn cleanup_route(
         route: &RouteAddr,
+        args: &NcArgs,
         routes: &mut HashMap<RouteAddr, RouterToNetSink>,
         channels: &mut ChannelMap,
     ) {
         let removed = routes.remove(route);
-        assert!(removed.is_some());
+
+        // In channels mode we might have torn down an extra route here, which would cause cleanup_route to be called
+        // to notify us that the route had closed, but that's because we already did it. Permit it to happen in this
+        // mode.
+        if removed.is_none() {
+            assert!(args.forwarding_mode == ForwardingMode::Channels);
+            return;
+        }
+
+        // In channels mode, if a socket at one end of a channel is disconnected, the socket at the other end should
+        // also be disconnected, because most programs don't expect upon reconnection to encounter the same socket state
+        // as before. So "forward" the disconnection onwards to the other end of the channel. For user who don't want
+        // this behavior, the LingerChannels mode will work.
+        if args.forwarding_mode == ForwardingMode::Channels {
+            // Make sure to grab this before removing the channel below, which would delete this information from the
+            // channel map.
+            if let Some(channel_dest) = channels.get_dest_route(route) {
+                eprintln!("Also disconnecting other end of channel: {}", channel_dest);
+                let removed = routes.remove(channel_dest);
+                assert!(removed.is_some());
+            }
+        }
 
         channels.remove_route(route);
 
@@ -443,7 +465,7 @@ impl<'a> TcpRouter<'a> {
 
                     let mut broken_routes = RouteAddrSet::new();
                     let mut did_send = false;
-                    if self.args.forwarding_mode == ForwardingMode::Channels {
+                    if self.args.is_using_channels() {
                         // Look up whether this incoming route has a corresponding destination route in a channel.
                         if let Some(channel_dest) = self.channels.get_dest_route(&sb.route) {
                             if self.args.verbose {
@@ -508,7 +530,7 @@ impl<'a> TcpRouter<'a> {
                     // which would just result in more errors.
                     if !broken_routes.is_empty() {
                         for route in broken_routes.iter() {
-                            Self::cleanup_route(route, &mut self.routes, &mut self.channels);
+                            Self::cleanup_route(route, self.args, &mut self.routes, &mut self.channels);
                         }
                     }
                 },
@@ -1524,7 +1546,7 @@ async fn handle_udp_sockets(
             assert!(added);
             lifetime_client_count += 1;
 
-            if args.forwarding_mode == ForwardingMode::Channels {
+            if args.is_using_channels() {
                 channels.add_route(route, known_routes.iter());
             }
 
@@ -1561,7 +1583,7 @@ async fn handle_udp_sockets(
 
                     print_udp_assoc(&sb.route);
 
-                    if args.forwarding_mode == ForwardingMode::Channels {
+                    if args.is_using_channels() {
                         channels.add_route(&sb.route, known_routes.iter());
                     }
 
@@ -1580,7 +1602,7 @@ async fn handle_udp_sockets(
 
                 // If using channel routing, look up if there's a known channel that this incoming packet should be
                 // forwarded to.
-                if args.forwarding_mode == ForwardingMode::Channels {
+                if args.is_using_channels() {
                     if let Some(channel_dest) = channels.get_dest_route(&sb.route) {
                         if args.verbose {
                             eprintln!("Forwarding on channel {} -> {}", sb.route, channel_dest);
@@ -1710,9 +1732,13 @@ enum ForwardingMode {
     #[value(name = "broker", alias = "b")]
     Broker,
 
-    /// Channel mode: automatically group pairs of remote addresses from different IP addresses into "channels" and forward traffic between the two endpoints, but not between different channels. Automatically sets -m 10.
+    /// Channel mode: automatically group pairs of remote addresses from different IP addresses into "channels" and forward traffic between the two endpoints, but not between different channels. If one end of a channel disconnects, it automatically disconnects the other end too. This disconnection part has no effect with UDP. Automatically sets -m 10.
     #[value(name = "channels", alias = "c")]
     Channels,
+
+    /// Lingering Channel mode: same as channels mode, but if one end of a channel disconnects, the other is left open.
+    #[value(name = "linger-channels", alias = "lc")]
+    LingerChannels,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
@@ -1846,6 +1872,15 @@ pub struct NcArgs {
     targets: Vec<String>,
 }
 
+impl NcArgs {
+    fn is_using_channels(&self) -> bool {
+        match self.forwarding_mode {
+            ForwardingMode::Channels | ForwardingMode::LingerChannels => true,
+            _ => false,
+        }
+    }
+}
+
 fn usage(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
     eprintln!();
@@ -1890,7 +1925,9 @@ async fn main() -> Result<(), String> {
     if args.max_clients.is_none() {
         args.max_clients = Some(match args.forwarding_mode {
             ForwardingMode::Null => 1,
-            ForwardingMode::Broker | ForwardingMode::Channels => 10,
+            ForwardingMode::Broker | ForwardingMode::Channels | ForwardingMode::LingerChannels => {
+                10
+            }
         });
     }
 
