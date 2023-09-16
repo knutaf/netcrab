@@ -326,6 +326,9 @@ struct TcpRouter<'a> {
 
     // Used to figure out when to hook up the local input.
     lifetime_client_count: u32,
+
+    // When the router is shutting down, give clients a way to check if they should continue interacting with it or not.
+    pub is_done: bool,
 }
 
 impl<'a> TcpRouter<'a> {
@@ -348,6 +351,7 @@ impl<'a> TcpRouter<'a> {
                 futures::sink::drain().sink_map_err(map_drain_sink_err_to_io_err),
             ),
             lifetime_client_count: 0,
+            is_done: false,
         }
     }
 
@@ -463,6 +467,25 @@ impl<'a> TcpRouter<'a> {
                         eprintln!("Router handling traffic: {:?}", sb);
                     }
 
+                    // If local IO sent an empty message, that means it was closed.
+                    if sb.data.is_empty() && sb.route.peer == LOCAL_IO_PEER_ADDR {
+                        // The user asked to exit the program after the input stream closed. Clear all the routes, which
+                        // will cause graceful disconnections on all of them. Mark the router as done so the caller can
+                        // know not to do further work.
+                        if self.args.should_exit_after_input_closed {
+                            self.is_done = true;
+
+                            // Before disconnecting all the sockets, give a small amount of time to allow in-flight
+                            // traffic to be sent.
+                            //
+                            // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
+                            // sent to the network rather than a random delay, but I'm not sure how.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            self.routes.clear();
+                            continue;
+                        }
+                    }
+
                     let mut broken_routes = RouteAddrSet::new();
                     let mut did_send = false;
                     if self.args.is_using_channels() {
@@ -538,6 +561,9 @@ impl<'a> TcpRouter<'a> {
                 // Send in all data from the local input to the router.
                 _result = local_io_to_router_sink.send_all(&mut self.local_io_stream).fuse() => {
                     eprintln!("End of outbound data from local machine reached.");
+
+                    // Send an empty message as a special signal that the local stream has finished.
+                    local_io_to_router_sink.send(Bytes::new()).await.expect("Local IO sink should not be closed early!");
                     self.local_io_stream = Box::pin(futures::stream::pending());
                 },
             }
@@ -1051,25 +1077,30 @@ async fn do_tcp_connect(
                                 }
                             };
 
-                        // Notify the router that a connection failed so it can clean it up.
-                        router.remove_route(&route_addr);
+                        // Every time a socket closes, it's possible it was because the router finished, so check to
+                        // make sure the router is still active before doing things like reconnecting.
+                        if !router.is_done {
+                            // Notify the router that a connection failed so it can clean it up. Possible that this happened
+                            // because the router itself closed the route, in which case this will have no effect.
+                            router.remove_route(&route_addr);
 
-                        // When reconnecting, just do another connection and add it to the list of ongoing connections
-                        // being tracked.
-                        if should_reconnect {
-                            match tcp_connect_to_candidate(&route_addr.peer, source_addrs, args).await {
-                                Ok(tcp_stream) => {
-                                    // If we were able to connect to a candidate, add them to the router so they can
-                                    // send and receive traffic.
-                                    let route = router.add_route(&tcp_stream);
-                                    connections.push(handle_tcp_stream(
-                                        tcp_stream,
-                                        args,
-                                        route
-                                    ));
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
+                            // When reconnecting, just do another connection and add it to the list of ongoing connections
+                            // being tracked.
+                            if should_reconnect {
+                                match tcp_connect_to_candidate(&route_addr.peer, source_addrs, args).await {
+                                    Ok(tcp_stream) => {
+                                        // If we were able to connect to a candidate, add them to the router so they can
+                                        // send and receive traffic.
+                                        let route = router.add_route(&tcp_stream);
+                                        connections.push(handle_tcp_stream(
+                                            tcp_stream,
+                                            args,
+                                            route
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
+                                    }
                                 }
                             }
                         }
@@ -1252,8 +1283,9 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                 };
 
                 // After handling a client, either loop and accept another client or exit, depending on the user's
-                // choice.
-                if !args.is_listening_repeatedly {
+                // choice. There are two reasons to exit: the user asked to listen only one time, or the router has shut
+                // down.
+                if !args.is_listening_repeatedly || router.is_done {
                     return stream_result;
                 }
 
@@ -1573,6 +1605,20 @@ async fn handle_udp_sockets(
                     eprintln!("Router handling traffic: {:?}", sb);
                 }
 
+                // If local IO sent an empty message, that means it was closed.
+                if sb.data.is_empty() && sb.route.peer == LOCAL_IO_PEER_ADDR {
+                    // The user asked to exit the program after the input stream closed.
+                    if args.should_exit_after_input_closed {
+                        // Before quitting and therefore disconnecting all the sockets, give a small amount of time to
+                        // allow in-flight traffic to be sent.
+                        //
+                        // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
+                        // sent to the network rather than a random delay, but I'm not sure how.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        return Ok(());
+                    }
+                }
+
                 // On every inbound packet, check if we already know about the remote peer who sent it. If not, start
                 // tracking the peer so we can forward traffic to it if needed.
                 //
@@ -1673,6 +1719,8 @@ async fn handle_udp_sockets(
             _result = local_io_to_router_sink.send_all(&mut local_io_stream).fuse() => {
                 eprintln!("End of outbound data from local machine reached.");
                 local_io_stream = Box::pin(futures::stream::pending());
+                // Send an empty message as a special signal that the local stream has finished.
+                local_io_to_router_sink.send(Bytes::new()).await.expect("Local IO sink should not be closed early!");
             },
         }
     }
@@ -1840,6 +1888,10 @@ pub struct NcArgs {
     /// Output mode
     #[arg(short = 'o', value_enum, default_value_t = OutputMode::Stdout)]
     output_mode: OutputMode,
+
+    /// Exit after input completes (e.g. after stdin EOF)
+    #[arg(long = "exit-after-input")]
+    should_exit_after_input_closed: bool,
 
     /// Join multicast group given by hostname (outbound UDP only)
     #[arg(long = "mc", requires = "is_udp", requires = "targets")]
