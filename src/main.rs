@@ -61,6 +61,16 @@ impl std::fmt::Display for RouteAddr {
     }
 }
 
+// Due to a bug in the `console` crate (https://github.com/console-rs/console/issues/172), the terminal state can get
+// messed up on *nix platforms if the program exits while it's in a blocking read call. So set the default input mode
+// to the no-char version, which doesn't have this problem. Users can still opt in to the more interactive mode if they
+// want.
+const DEFAULT_INPUT_MODE: InputMode = if cfg!(unix) {
+    InputMode::StdinNoCharMode
+} else {
+    InputMode::Stdin
+};
+
 // Bytes sourced from the local machine are marked with a special peer address so they can be treated similarly to
 // sockets even when it's not a real socket (and therefore doesn't have a real network address.
 const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
@@ -1882,7 +1892,7 @@ pub struct NcArgs {
     ttl_opt: Option<u32>,
 
     /// Input mode
-    #[arg(short = 'i', value_enum, default_value_t = InputMode::Stdin)]
+    #[arg(short = 'i', value_enum, default_value_t = DEFAULT_INPUT_MODE)]
     input_mode: InputMode,
 
     /// Output mode
