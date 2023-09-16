@@ -65,6 +65,8 @@ The input mode can be controlled. By default, input comes from stdin. It accepts
 - `echo`: any received traffic will be echoed back to its sender.
 - `rand`: random data will be generated. The random sizes of data can be controlled by `--rsizemin` and `--rsizemax`, and the type of data can be controlled by `--rvals`.
 
+When using one of the stdin modes as input, you can specify `--exit-after-input` to quit the program after the input stream reaches end of file.
+
 ## Output mode
 
 `netcrab -o MODE`
