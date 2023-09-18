@@ -1,4 +1,3 @@
-// TODO knutaf fmt
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
@@ -48,10 +47,10 @@ struct RouteAddr {
 }
 
 impl RouteAddr {
-    fn from_tcp_stream(socket: &tokio::net::TcpStream) -> Self {
+    fn from_tcp_stream(rx_socket: &tokio::net::tcp::OwnedReadHalf) -> Self {
         Self {
-            local: socket.local_addr().unwrap(),
-            peer: socket.peer_addr().unwrap(),
+            local: rx_socket.local_addr().unwrap(),
+            peer: rx_socket.peer_addr().unwrap(),
         }
     }
 }
@@ -87,11 +86,6 @@ const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr {
 
 // Emit stats every 1 sec.
 const STATS_OUTPUT_PERIOD: std::time::Duration = std::time::Duration::new(1, 0);
-
-// Global counters for send stats that can be accessed deep in the send path.
-static BYTE_COUNT_SENT_TO_NETWORK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static SEND_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // A buffer of bytes that carries both the remote peer that sent it to this machine and the local address it was
 // destined for. Used for figuring out which remote machines it should be forwarded to.
@@ -135,19 +129,10 @@ type LocalIoSinkAndStream<'a> = (LocalIoSink, LocalIoStream<'a>);
 // it sends it into this sink, where there is one per remote peer.
 type RouterToNetSink<'a> = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error> + 'a>>;
 
-// A stream of bytes produced by the router and consumed by a socket. The socket uses `send_all` to drive data from this
-// stream into its per-socket sink and thus out to the network.
-type RouterToNetStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>>>>;
-
 // A sink of bytes originating from some remote peer. Each socket drives data received on it to the router using this
 // sink, supplying where the data came from as well as the local address it arrives at. The router uses the data's
 // origin and local destination to decide where the data should be forwarded to.
 type NetToRouterSink = Pin<Box<dyn futures::Sink<SourcedBytes, Error = std::io::Error>>>;
-
-// When the program wants to add a new remote peer to the router so that the router can forward data to it, the router
-// provides a sink for the socket to send data into to reach the router; and a stream of data from the router that the
-// socket should send to the remote peer.
-type RouteSinkAndStream = (NetToRouterSink, RouterToNetStream);
 
 // A grouping of connection information for a user-specified target, something passed as a command line arg. The
 // original argument value is stored as well as all the addresses that the name resolved to.
@@ -411,27 +396,20 @@ impl<'a> TcpRouter<'a> {
         }
     }
 
-    // Callers use this to add a new destination to the router for forwarding. It provides back a sink that the caller
-    // can use to pass in data from the network, and a stream of data that should be sent to the destination.
-    pub fn add_route(&mut self, socket: &tokio::net::TcpStream) -> RouteSinkAndStream {
+    // Callers use this to add a new destination to the router for forwarding. The caller passes in the part of the TCP
+    // socket that the router can use to write data to the socket, and it returns a sink where the caller can write data
+    // to the router.
+    pub fn add_route(&mut self, tx_socket: tokio::net::tcp::OwnedWriteHalf) -> NetToRouterSink {
         let new_route = RouteAddr {
-            local: socket.local_addr().unwrap(),
-            peer: socket.peer_addr().unwrap(),
+            local: tx_socket.local_addr().unwrap(),
+            peer: tx_socket.peer_addr().unwrap(),
         };
 
-        // TODO: It would be great to take the socket sink directly and return the router sink, and eliminate this
-        // internal channel, but that makes me take the TcpStream internally, and I can't figure out how to make the
-        // lifetimes work.
-        let (collector_to_net_sink, router_to_net_stream) = mpsc::unbounded();
+        // Store the sink where the router will send data that should go to this destination.
+        let router_to_net_sink: RouterToNetSink =
+            Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()));
 
-        let collector_to_net_sink =
-            collector_to_net_sink.sink_map_err(map_unbounded_sink_err_to_io_err);
-        let router_to_net_stream = router_to_net_stream.map(Ok);
-
-        // Store the sink where the router will send data that should go to this destination. The output end of the
-        // stream is given back to the caller so they can pull data from it and send it to the actual socket.
-        self.routes
-            .insert(new_route.clone(), Box::pin(collector_to_net_sink));
+        self.routes.insert(new_route.clone(), router_to_net_sink);
 
         if self.args.is_using_channels() {
             self.channels.add_route(&new_route, self.routes.keys());
@@ -446,10 +424,7 @@ impl<'a> TcpRouter<'a> {
 
         // The input end of the router (`net_collector_sink`) can be cloned to allow multiple callers to pass data into
         // the same channel.
-        (
-            Box::pin(self.net_collector_sink.clone()),
-            Box::pin(router_to_net_stream),
-        )
+        Box::pin(self.net_collector_sink.clone())
     }
 
     pub fn remove_route(&mut self, route: &RouteAddr) {
@@ -1125,8 +1100,9 @@ async fn do_tcp_connect(
                 Ok(tcp_stream) => {
                     // If we were able to connect to a candidate, add them to the router so they can send and receive
                     // traffic.
-                    let route = router.add_route(&tcp_stream);
-                    connections.push(handle_tcp_stream(tcp_stream, args, route));
+                    let (rx_socket, tx_socket) = tcp_stream.into_split();
+                    let net_to_router_sink = router.add_route(tx_socket);
+                    connections.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
 
                     // Stop after first successful connection for this target.
                     break;
@@ -1182,11 +1158,12 @@ async fn do_tcp_connect(
                                     Ok(tcp_stream) => {
                                         // If we were able to connect to a candidate, add them to the router so they can
                                         // send and receive traffic.
-                                        let route = router.add_route(&tcp_stream);
+                                        let (rx_socket, tx_socket) = tcp_stream.into_split();
+                                        let net_to_router_sink = router.add_route(tx_socket);
                                         connections.push(handle_tcp_stream(
-                                            tcp_stream,
+                                            rx_socket,
                                             args,
-                                            route
+                                            net_to_router_sink
                                         ));
                                     }
                                     Err(e) => {
@@ -1340,7 +1317,7 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
         futures::select! {
             accept_result = accepts.select_next_some() => {
                 match accept_result {
-                    Ok((stream, ref peer_addr)) => {
+                    Ok((tcp_stream, ref peer_addr)) => {
                         eprintln!(
                             "Accepted connection from {}, protocol TCP, family {}",
                             peer_addr,
@@ -1349,8 +1326,9 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
 
                         // Track the accepted TCP socket here. This future will complete when the socket disconnects.
                         // At the same time, make it known to the router so it can service traffic to and from it.
-                        let route = router.add_route(&stream);
-                        clients.push(handle_tcp_stream(stream, args, route));
+                        let (rx_socket, tx_socket) = tcp_stream.into_split();
+                        let net_to_router_sink = router.add_route(tx_socket);
+                        clients.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
                     }
                     Err(e) => {
                         // If there was an error accepting a connection, bail out if the user asked to listen only once.
@@ -1391,26 +1369,16 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
 }
 
 async fn handle_tcp_stream(
-    mut tcp_stream: tokio::net::TcpStream,
+    rx_socket: tokio::net::tcp::OwnedReadHalf,
     args: &NcArgs,
-    router_io: RouteSinkAndStream,
+    mut net_to_router_sink: NetToRouterSink,
 ) -> (std::io::Result<()>, RouteAddr) {
-    let route_addr = RouteAddr::from_tcp_stream(&tcp_stream);
+    let route_addr = RouteAddr::from_tcp_stream(&rx_socket);
 
     // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
     if args.is_zero_io {
         return (Ok(()), route_addr);
     }
-
-    // The sink is the place where this function can send data coming from the network. The stream is data from the
-    // router that should be sent to the network.
-    let (mut net_to_router_sink, mut router_to_net_stream) = router_io;
-
-    let (rx_socket, tx_socket) = tcp_stream.split();
-
-    // Set up a sink that accepts data from the router and sends it out of the TCP socket.
-    let mut router_to_net_sink: RouterToNetSink =
-        Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()));
 
     // Set up a stream that produces chunks of data from the network. The sink into the router requires SourcedBytes
     // that include the remote peer's address. Also have to convert from BytesMut (which the socket read provides) to
@@ -1425,14 +1393,13 @@ async fn handle_tcp_stream(
 
     // End when the socket is closed. Return the final error along with the peer address that this socket was connected
     // to, so the program can tell the user which socket closed.
-    futures::select! {
-        result = router_to_net_sink.send_all(&mut router_to_net_stream).fuse() => {
-            (result, route_addr)
-        },
-        result = net_to_router_sink.send_all(&mut net_to_router_stream).fuse() => {
-            (result, route_addr)
-        },
-    }
+    (
+        net_to_router_sink
+            .send_all(&mut net_to_router_stream)
+            .fuse()
+            .await,
+        route_addr,
+    )
 }
 
 async fn bind_udp_sockets(
