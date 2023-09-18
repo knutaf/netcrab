@@ -1,3 +1,4 @@
+// TODO knutaf fmt
 // For AsRawFd/AsRawSocket shenanigans.
 #![feature(trait_alias)]
 
@@ -84,6 +85,14 @@ const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr {
     peer: LOCAL_IO_PEER_ADDR,
 };
 
+// Emit stats every 1 sec.
+const STATS_OUTPUT_PERIOD: std::time::Duration = std::time::Duration::new(1, 0);
+
+// Global counters for send stats that can be accessed deep in the send path.
+static BYTE_COUNT_SENT_TO_NETWORK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static SEND_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // A buffer of bytes that carries both the remote peer that sent it to this machine and the local address it was
 // destined for. Used for figuring out which remote machines it should be forwarded to.
 #[derive(Debug)]
@@ -107,10 +116,6 @@ impl SourcedBytes {
 type SockAddrSet = HashSet<SocketAddr>;
 type RouteAddrSet = HashSet<RouteAddr>;
 
-// A grouping of a data buffer plus the address it should be sent to. Primarly used for UDP traffic, where the
-// `UdpFramed` sink and stream use this tuple.
-type TargetedBytes = (Bytes, SocketAddr);
-
 // A stream of bytes produced from the local machine. In contrast with bytes that come from the network, it has no
 // source address, though that is faked later in order to make it be treated just like other sockets by the router for
 // purposes of forwarding.
@@ -126,16 +131,13 @@ type LocalIoSink = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error>>>;
 // program should go.
 type LocalIoSinkAndStream<'a> = (LocalIoSink, LocalIoStream<'a>);
 
-// A sink that accepts TargetedBytes -- a byte buffer plus the destination it should go to. Note that for TCP sockets,
-// the destination is ignored, because each socket already implicitly contains the destination.
-//
-// When the router determines that data should be sent to a socket, it sends it into this sink, where there is one per
-// remote peer.
-type RouterToNetSink = Pin<Box<dyn futures::Sink<TargetedBytes, Error = std::io::Error>>>;
+// A sink that accepts Bytes to be sent to the network. When the router determines that data should be sent to a socket,
+// it sends it into this sink, where there is one per remote peer.
+type RouterToNetSink<'a> = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error> + 'a>>;
 
-// A stream of bytes plus the destination it should go to, produced by the router and consumed by a socket. The socket
-// uses `send_all` to drive data from this stream into its per-socket sink and thus out to the network.
-type RouterToNetStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<TargetedBytes>>>>;
+// A stream of bytes produced by the router and consumed by a socket. The socket uses `send_all` to drive data from this
+// stream into its per-socket sink and thus out to the network.
+type RouterToNetStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>>>>;
 
 // A sink of bytes originating from some remote peer. Each socket drives data received on it to the router using this
 // sink, supplying where the data came from as well as the local address it arrives at. The router uses the data's
@@ -176,6 +178,50 @@ impl std::fmt::Display for ConnectionTarget {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Default, Clone)]
+struct Stats {
+    send_byte_count: usize,
+    send_count: usize,
+    recv_byte_count: usize,
+    recv_count: usize,
+}
+
+struct StatsTracker {
+    stats_since_last_log: Stats,
+    last_log_time: std::time::Instant,
+}
+
+impl StatsTracker {
+    fn new() -> Self {
+        Self {
+            stats_since_last_log: Stats::default(),
+            last_log_time: std::time::Instant::now(),
+        }
+    }
+
+    fn record_send(&mut self, data: &Bytes) {
+        self.stats_since_last_log.send_byte_count += data.len();
+        self.stats_since_last_log.send_count += 1;
+    }
+
+    fn record_recv(&mut self, data: &Bytes) {
+        self.stats_since_last_log.recv_byte_count += data.len();
+        self.stats_since_last_log.recv_count += 1;
+    }
+
+    fn try_consume_stats(&mut self) -> Option<Stats> {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_log_time) > STATS_OUTPUT_PERIOD {
+            let ret = self.stats_since_last_log.clone();
+            self.stats_since_last_log = Stats::default();
+            self.last_log_time = now;
+            Some(ret)
+        } else {
+            None
+        }
     }
 }
 
@@ -312,7 +358,7 @@ struct TcpRouter<'a> {
 
     // A collection of known remote peers, indexed by the remote peer address. Each known peer has a sink that is used
     // for the router to send data to that peer.
-    routes: HashMap<RouteAddr, RouterToNetSink>,
+    routes: HashMap<RouteAddr, RouterToNetSink<'a>>,
 
     // Storage for channels, which are associations of two remote endpoints together for forwarding to each other but
     // not to other channels.
@@ -461,6 +507,8 @@ impl<'a> TcpRouter<'a> {
         // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
         let mut local_io_sink_opt = Some(&mut self.local_io_sink);
 
+        let mut stats_tracker = StatsTracker::new();
+
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
         // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
         // and then restarted.
@@ -508,9 +556,11 @@ impl<'a> TcpRouter<'a> {
                             // Look up the sink to send to for this route. There always is one, so `unwrap` is OK.
                             let dest_sink = self.routes.get_mut(channel_dest).unwrap();
 
-                            if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest.peer)).await {
+                            if let Err(e) = dest_sink.send(sb.data.clone()).await {
                                 eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
                                 broken_routes.insert(channel_dest.clone());
+                            } else {
+                                stats_tracker.record_send(&sb.data);
                             }
 
                             did_send = true;
@@ -540,15 +590,18 @@ impl<'a> TcpRouter<'a> {
                             // It could be possible to omit the peer address for the TcpRouter, because the peer address
                             // is implicit with the socket, but I'm going to keep it this way for symmetry for now,
                             // until it becomes a perf problem.
-                            if let Err(e) = dest_sink.send((sb.data.clone(), dest_route.peer)).await {
+                            if let Err(e) = dest_sink.send(sb.data.clone()).await {
                                 eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
                                 broken_routes.insert(dest_route.clone());
+                            } else {
+                                stats_tracker.record_send(&sb.data);
                             }
                         }
                     }
 
                     // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
                     if sb.route.peer != LOCAL_IO_PEER_ADDR {
+                        stats_tracker.record_recv(&sb.data);
                         if let Some(ref mut local_io_sink) = local_io_sink_opt {
                             // If we hit an error emitting output, clear out the local output sink so we don't bother
                             // trying to output more.
@@ -564,6 +617,17 @@ impl<'a> TcpRouter<'a> {
                     if !broken_routes.is_empty() {
                         for route in broken_routes.iter() {
                             Self::cleanup_route(route, self.args, &mut self.routes, &mut self.channels);
+                        }
+                    }
+
+                    // Output throughput stats periodically if requested by the user.
+                    if self.args.should_track_stats {
+                        if let Some(stats) = stats_tracker.try_consume_stats() {
+                            eprintln!("recv {:>12} B/s ({:>7} recvs/s), send {:>12} B/s ({:>7} sends/s)",
+                                stats.recv_byte_count,
+                                stats.recv_count,
+                                stats.send_byte_count,
+                                stats.send_count);
                         }
                     }
                 },
@@ -584,12 +648,6 @@ impl<'a> TcpRouter<'a> {
 // Convenience method for formatting an io::Error to String.
 fn format_io_err(err: std::io::Error) -> String {
     format!("{}: {}", err.kind(), err)
-}
-
-// When sending data from a socket to the local output, remove the destination, to match the format that LocalIoSink
-// requires.
-async fn fut_remove_target_addr(input: TargetedBytes) -> std::io::Result<Bytes> {
-    Ok(input.0)
 }
 
 // All mpsc::UnboundedSenders use a different error type than the std::io::Error that we use everywhere else in the
@@ -755,46 +813,52 @@ fn setup_async_stdin_reader_thread(
 
 // An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
 // Result<Bytes> to fit the way it is used to produce a stream of Bytes.
-struct RandBytesIter<'a, TDist>
-where
-    TDist: rand::distributions::Distribution<u8>,
-{
-    args: &'a NcArgs,
-
-    // TODO: Would rather make this a template type or impl that satisfies Iterator<Item = u8>, but I don't know how to
-    // express that.
-    rand_iter: rand::distributions::DistIter<TDist, rand::rngs::ThreadRng, u8>,
+struct RandBytesIter {
+    config: RandConfig,
+    rand_iter: Box<dyn Iterator<Item = u8>>,
     rng: rand::rngs::ThreadRng,
 
     // Temporary storage for filling the next chunk before it's emitted from next(). Stored here to reduce allocations.
     chunk_storage: Vec<u8>,
 }
 
-impl<'a, TDist> RandBytesIter<'a, TDist>
-where
-    TDist: rand::distributions::Distribution<u8>,
-{
-    fn new(args: &'a NcArgs, dist: TDist) -> RandBytesIter<TDist> {
+impl RandBytesIter {
+    fn new(config: &RandConfig) -> RandBytesIter {
+        // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here
+        // because the match arms have different concrete types (different Distribution implementations).
+        let rand_iter: Box<dyn Iterator<Item = u8>> = match config.vals {
+            RandValueType::Binary => {
+                // Use a standard distribution across all u8 values.
+                Box::new(rand::thread_rng().sample_iter(rand::distributions::Standard))
+            }
+            RandValueType::Ascii => {
+                // Make a distribution that references only ASCII characters. Slice returns a reference to the element
+                // in the original array, so map and dereference to return u8 instead of &u8.
+                let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
+                    .unwrap()
+                    .map(|e| *e);
+
+                Box::new(rand::thread_rng().sample_iter(ascii_dist))
+            }
+        };
+
         Self {
-            args,
-            rand_iter: rand::thread_rng().sample_iter(dist),
+            config: config.clone(),
+            rand_iter,
             rng: rand::thread_rng(),
-            chunk_storage: vec![0u8; args.rand_config.size_max],
+            chunk_storage: vec![0u8; config.size_max],
         }
     }
 }
 
-impl<'a, TDist> Iterator for RandBytesIter<'a, TDist>
-where
-    TDist: rand::distributions::Distribution<u8>,
-{
+impl Iterator for RandBytesIter {
     type Item = std::io::Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Figure out the next random size of the chunk.
         let next_size = self
             .rng
-            .gen_range(self.args.rand_config.size_min..=self.args.rand_config.size_max);
+            .gen_range(self.config.size_min..=self.config.size_max);
 
         // Fill that amount of the temporary storage with random data.
         for i in 0..next_size {
@@ -809,39 +873,37 @@ where
     }
 }
 
-fn setup_random_io(args: &NcArgs) -> LocalIoSinkAndStream {
-    // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here because
-    // the match arms have different concrete types (different Distribution implementations).
-    let rng_iter: LocalIoStream = match args.rand_config.vals {
-        RandValueType::Binary => {
-            // Use a standard distribution across all u8 values.
-            local_io_stream_from_iter(RandBytesIter::new(args, rand::distributions::Standard))
-        }
-        RandValueType::Ascii => {
-            // Make a distribution that references only ASCII characters. Slice returns a reference to the element in the
-            // original array, so map and dereference to return u8 instead of &u8.
-            let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
-                .unwrap()
-                .map(|e| *e);
+// An iterator that produces the same Bytes value infinitely. I couldn't get stream::repeat() to work, so I had to write
+// this.
+struct FixedBytesIter {
+    bytes: Bytes,
+}
 
-            local_io_stream_from_iter(RandBytesIter::new(args, ascii_dist))
-        }
-    };
+impl FixedBytesIter {
+    fn new(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+}
 
-    (setup_local_output(args), rng_iter)
+impl Iterator for FixedBytesIter {
+    type Item = std::io::Result<Bytes>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(Ok(self.bytes.clone()))
+    }
 }
 
 fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
-    // When using TCP, read a byte at a time to send as fast as possible. When using UDP, use the user's requested size
-    // to produce datagrams of the correct size.
-    let chunk_size = if args.is_udp { args.sendbuf_size } else { 1 };
-
     match args.input_mode {
         InputMode::Null => (
             setup_local_output(args),
             Box::pin(futures::stream::pending()),
         ),
         InputMode::Stdin | InputMode::StdinNoCharMode => {
+            // When using TCP, read a byte at a time to send as fast as possible. When using UDP, use the user's requested size
+            // to produce datagrams of the correct size.
+            let chunk_size = if args.is_udp { args.sendbuf_size } else { 1 };
+
             (
                 setup_local_output(args),
                 // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
@@ -855,7 +917,25 @@ fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
             setup_local_output(args),
             Box::pin(futures::stream::pending()),
         ),
-        InputMode::Random => setup_random_io(args),
+        InputMode::Random => (
+            setup_local_output(args),
+            local_io_stream_from_iter(RandBytesIter::new(&args.rand_config)),
+        ),
+        InputMode::Fixed => (setup_local_output(args), {
+            // Create a random buffer of the size requested by sendbuf_size and containing data that matches the
+            // user's requested random values configuration.
+            let conf = RandConfig {
+                size_min: args.sendbuf_size as usize,
+                size_max: args.sendbuf_size as usize,
+                vals: args.rand_config.vals,
+            };
+
+            let fixed_buf = RandBytesIter::new(&conf).next().unwrap().unwrap();
+            assert!(fixed_buf.len() == args.sendbuf_size as usize);
+
+            // Return a stream that will just keep producing that same fixed buffer forever.
+            local_io_stream_from_iter(FixedBytesIter::new(fixed_buf))
+        }),
     }
 }
 
@@ -937,6 +1017,7 @@ where
         }
 
         s2.set_send_buffer_size(args.sendbuf_size as usize)?;
+        s2.set_recv_buffer_size(args.recvbuf_size as usize)?;
 
         // If joining a multicast group, the TTL param was used above for the multicast TTL. Don't set it as the unicast
         // TTL too.
@@ -1327,10 +1408,9 @@ async fn handle_tcp_stream(
 
     let (rx_socket, tx_socket) = tcp_stream.split();
 
-    // Set up a sink that sends data out of the TCP socket. This data will come from the router, which gives
-    // TargetedBytes, so use fut_remove_target_addr to convert it to just Bytes, which is what the BytesCodec needs.
-    let mut router_to_net_sink =
-        Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()).with(fut_remove_target_addr));
+    // Set up a sink that accepts data from the router and sends it out of the TCP socket.
+    let mut router_to_net_sink: RouterToNetSink =
+        Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()));
 
     // Set up a stream that produces chunks of data from the network. The sink into the router requires SourcedBytes
     // that include the remote peer's address. Also have to convert from BytesMut (which the socket read provides) to
@@ -1603,6 +1683,8 @@ async fn handle_udp_sockets(
         }
     }
 
+    let mut stats_tracker = StatsTracker::new();
+
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
     loop {
         futures::select! {
@@ -1670,6 +1752,8 @@ async fn handle_udp_sockets(
                         if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest.peer)).await {
                             eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
                             broken_routes.insert(channel_dest.clone());
+                        } else {
+                            stats_tracker.record_send(&sb.data);
                         }
 
                         did_send = true;
@@ -1700,6 +1784,8 @@ async fn handle_udp_sockets(
                             if let Err(e) = socket_sink.send((sb.data.clone(), dest_route.peer)).await {
                                 eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
                                 broken_routes.insert(dest_route.clone());
+                            } else {
+                                stats_tracker.record_send(&sb.data);
                             }
                         }
                     }
@@ -1707,6 +1793,7 @@ async fn handle_udp_sockets(
 
                 // Came from a remote endpoint, so also send to local IO.
                 if sb.route.peer != LOCAL_IO_PEER_ADDR {
+                    stats_tracker.record_recv(&sb.data);
                     if let Some(ref mut local_io_sink) = local_io_sink_opt {
                         // If we hit an error emitting output, clear out the local output sink so we don't bother
                         // trying to output more.
@@ -1723,6 +1810,20 @@ async fn handle_udp_sockets(
                     for route in broken_routes.iter() {
                         known_routes.remove(route);
                         channels.remove_route(route);
+                    }
+                }
+
+                // TODO: would love to get rid of the duplication between this and TcpRouter, but it's just slightly
+                // different.
+                //
+                // Output throughput stats periodically if requested by the user.
+                if args.should_track_stats {
+                    if let Some(stats) = stats_tracker.try_consume_stats() {
+                        eprintln!("recv {:>12} B/s ({:>7} p/s), send {:>12} B/s ({:>7} p/s)",
+                            stats.recv_byte_count,
+                            stats.recv_count,
+                            stats.send_byte_count,
+                            stats.send_count);
                     }
                 }
             },
@@ -1768,6 +1869,10 @@ enum InputMode {
     /// Generate random data to send to the network
     #[value(name = "rand", alias = "r")]
     Random,
+
+    /// Repeatedly send the same random buffer forever. The size of the buffer is controlled by --sb and the contents are controlled by --rvals. Only useful for perf testing, really
+    #[value(name = "fixed", alias = "f")]
+    Fixed,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
@@ -1879,6 +1984,10 @@ pub struct NcArgs {
     #[arg(long = "sb", default_value_t = 1)]
     sendbuf_size: u32,
 
+    /// Recv buffer size
+    #[arg(long = "rb", default_value_t = 65536)]
+    recvbuf_size: u32,
+
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
     is_zero_io: bool,
@@ -1920,6 +2029,10 @@ pub struct NcArgs {
 
     #[command(flatten)]
     rand_config: RandConfig,
+
+    /// Print ongoing throughput stats
+    #[arg(long = "stats")]
+    should_track_stats: bool,
 
     /// Emit verbose logging.
     #[arg(short = 'v')]

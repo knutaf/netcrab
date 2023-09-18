@@ -64,6 +64,7 @@ The input mode can be controlled. By default, input comes from stdin. It accepts
 - `stdin-nochar`: works the same as stdin, but doesn't engage "character mode". This works worse for interactive uses.
 - `echo`: any received traffic will be echoed back to its sender.
 - `rand`: random data will be generated. The random sizes of data can be controlled by `--rsizemin` and `--rsizemax`, and the type of data can be controlled by `--rvals`.
+- `fixed`: only really useful for perf testing. The same fixed-size message with fixed data will be sent infinitely. You can control the size using `--sb` and the type of random data in it with `--rvals`
 
 When using one of the stdin modes as input, you can specify `--exit-after-input` to quit the program after the input stream reaches end of file.
 
