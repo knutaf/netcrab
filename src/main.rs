@@ -914,100 +914,58 @@ fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
     }
 }
 
-mod sockconf {
-    use std::mem::ManuallyDrop;
+// Any socket, TCP or UDP, implements one of these traits for converting it to the OS's native socket handle type. To
+// use this with `socket2::SockRef` below, it needs to accept one of these traits, depending on which platform we're on.
+#[cfg(windows)]
+pub trait AsSocketHandleType = std::os::windows::io::AsSocket;
 
-    #[cfg(windows)]
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-    #[cfg(unix)]
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    #[cfg(windows)]
-    pub trait AsRawHandleType = AsRawSocket;
-
-    #[cfg(unix)]
-    pub trait AsRawHandleType = AsRawFd;
-
-    // There isn't a clean way to get from a Tokio TcpSocket or UdpSocket to its inner socket2::Socket, which offers
-    // basically all the possible setsockopts wrapped nicely. We can create a socket2::Socket out of a raw socket/fd
-    // though. But the socket2::Socket takes ownership of the handle and will close it on dtor, so wrap it in
-    // `ManuallyDrop`, which lets us leak it deliberately. The socket is owned properly by the Tokio socket anyway, so
-    // nothing is leaked.
-    //
-    // The way to create a socket2::Socket out of a raw handle/fd is different on Windows vs Unix, so support both ways.
-    // They only differ by whether RawSocket or RawFd is used.
-    //
-    // So as not to have to return the contents of the ManuallyDrop and to contain where this leaked socket goes, take
-    // a closure so the caller can pass in what to do with the socket.
-    //
-    // SAFETY:
-    // - the socket is a valid open socket at the point of this call.
-    // - the socket can be closed by closesocket - this doesn't apply, since we won't be closing it here.
-    pub fn with_socket2_from_socket<S, F>(socket: &S, func: F) -> std::io::Result<()>
-    where
-        S: AsRawHandleType,
-        F: FnOnce(&socket2::Socket) -> std::io::Result<()>,
-    {
-        let socket2 = ManuallyDrop::new(unsafe {
-            #[cfg(windows)]
-            let s = socket2::Socket::from_raw_socket(socket.as_raw_socket());
-
-            #[cfg(unix)]
-            let s = socket2::Socket::from_raw_fd(socket.as_raw_fd());
-
-            s
-        });
-
-        func(&socket2)
-    }
-}
+#[cfg(unix)]
+pub trait AsSocketHandleType = std::os::fd::AsFd;
 
 fn configure_socket_options<S>(socket: &S, is_ipv4: bool, args: &NcArgs) -> std::io::Result<()>
 where
-    S: sockconf::AsRawHandleType,
+    S: AsSocketHandleType,
 {
-    sockconf::with_socket2_from_socket(socket, |s2: &socket2::Socket| {
-        let socktype = s2.r#type()?;
+    let s2 = socket2::SockRef::from(socket);
+    let socktype = s2.r#type()?;
 
-        match socktype {
-            socket2::Type::DGRAM => {
-                s2.set_broadcast(args.is_broadcast)?;
+    match socktype {
+        socket2::Type::DGRAM => {
+            s2.set_broadcast(args.is_broadcast)?;
 
-                let multicast_ttl = args.ttl_opt.unwrap_or(1);
-                if is_ipv4 {
-                    s2.set_multicast_loop_v4(!args.should_disable_multicast_loopback)?;
-                    s2.set_multicast_ttl_v4(multicast_ttl)?;
-                } else {
-                    s2.set_multicast_loop_v6(!args.should_disable_multicast_loopback)?;
-                    s2.set_multicast_hops_v6(multicast_ttl)?;
-                }
-            }
-            socket2::Type::STREAM => {
-                // No stream-specific options for now
-            }
-            _ => {
-                eprintln!("Warning: unknown socket type {:?}", socktype);
+            let multicast_ttl = args.ttl_opt.unwrap_or(1);
+            if is_ipv4 {
+                s2.set_multicast_loop_v4(!args.should_disable_multicast_loopback)?;
+                s2.set_multicast_ttl_v4(multicast_ttl)?;
+            } else {
+                s2.set_multicast_loop_v6(!args.should_disable_multicast_loopback)?;
+                s2.set_multicast_hops_v6(multicast_ttl)?;
             }
         }
+        socket2::Type::STREAM => {
+            // No stream-specific options for now
+        }
+        _ => {
+            eprintln!("Warning: unknown socket type {:?}", socktype);
+        }
+    }
 
-        s2.set_send_buffer_size(args.sendbuf_size as usize)?;
-        s2.set_recv_buffer_size(args.recvbuf_size as usize)?;
+    s2.set_send_buffer_size(args.sendbuf_size as usize)?;
+    s2.set_recv_buffer_size(args.recvbuf_size as usize)?;
 
-        // If joining a multicast group, the TTL param was used above for the multicast TTL. Don't set it as the unicast
-        // TTL too.
-        if !args.should_join_multicast_group {
-            if let Some(ttl) = args.ttl_opt {
-                if is_ipv4 {
-                    s2.set_ttl(ttl)?;
-                } else {
-                    s2.set_unicast_hops_v6(ttl)?;
-                }
+    // If joining a multicast group, the TTL param was used above for the multicast TTL. Don't set it as the unicast
+    // TTL too.
+    if !args.should_join_multicast_group {
+        if let Some(ttl) = args.ttl_opt {
+            if is_ipv4 {
+                s2.set_ttl(ttl)?;
+            } else {
+                s2.set_unicast_hops_v6(ttl)?;
             }
         }
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 fn get_interface_index_from_local_addr(local_addr: &SocketAddr) -> std::io::Result<u32> {
@@ -1060,19 +1018,18 @@ fn join_multicast_group<S>(
     multi_addr: &SocketAddr,
 ) -> std::io::Result<()>
 where
-    S: sockconf::AsRawHandleType,
+    S: AsSocketHandleType,
 {
-    sockconf::with_socket2_from_socket(socket, |s2: &socket2::Socket| {
-        let interface_index = get_interface_index_from_local_addr(local_addr)?;
+    let s2 = socket2::SockRef::from(socket);
+    let interface_index = get_interface_index_from_local_addr(local_addr)?;
 
-        match multi_addr {
-            SocketAddr::V4(addr) => s2.join_multicast_v4_n(
-                addr.ip(),
-                &socket2::InterfaceIndexOrAddress::Index(interface_index),
-            ),
-            SocketAddr::V6(addr) => s2.join_multicast_v6(addr.ip(), interface_index),
-        }
-    })
+    match multi_addr {
+        SocketAddr::V4(addr) => s2.join_multicast_v4_n(
+            addr.ip(),
+            &socket2::InterfaceIndexOrAddress::Index(interface_index),
+        ),
+        SocketAddr::V6(addr) => s2.join_multicast_v6(addr.ip(), interface_index),
+    }
 }
 
 async fn do_tcp_connect(
