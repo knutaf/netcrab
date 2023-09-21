@@ -1,4 +1,4 @@
-// For AsRawFd/AsRawSocket shenanigans.
+// For AsFd/AsSocket shenanigans.
 #![feature(trait_alias)]
 
 extern crate regex;
@@ -225,6 +225,8 @@ lazy_static! {
     };
 
     static ref TARGET_MULTIPLIER_REGEX : Regex = Regex::new(r"x(\d+)$").expect("failed to compile regex");
+
+    static ref WILDCARD_HOST_REGEX : Regex = Regex::new(r"^\*(?::(\d+))?$").expect("failed to compile regex");
 }
 
 // Core logic used by the router to decide where to forward messages, generally used when not in channel mode.
@@ -1032,126 +1034,11 @@ where
     }
 }
 
-async fn do_tcp_connect(
-    targets: &Vec<ConnectionTarget>,
-    source_addrs: &SockAddrSet,
-    args: &NcArgs,
-) -> std::io::Result<()> {
-    assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
-    assert!(!targets.is_empty());
-
-    let mut connections = FuturesUnordered::new();
-    let mut router = TcpRouter::new(args);
-
-    // For each user-specified target hostname:port combo, try to connect to all of the addresses it resolved to. When
-    // one successful connection is established, move on to the next target. Otherwise we'd end up sending duplicate
-    // traffic to the same host.
-    for target in targets.iter() {
-        for addr in target.addrs.iter() {
-            // Skip incompatible candidates from what address family the user specified.
-            if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
-                continue;
-            }
-
-            match tcp_connect_to_candidate(addr, source_addrs, args).await {
-                Ok(tcp_stream) => {
-                    // If we were able to connect to a candidate, add them to the router so they can send and receive
-                    // traffic.
-                    let (rx_socket, tx_socket) = tcp_stream.into_split();
-                    let net_to_router_sink = router.add_route(tx_socket);
-                    connections.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
-
-                    // Stop after first successful connection for this target.
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to {}. Error: {}", addr, e);
-                }
-            }
-        }
-
-        // Fail if we couldn't connect to any address for a given target, even if we successfully connected to another
-        // target.
-        if connections.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!(
-                    "Failed to connect to all candidates for {}",
-                    &target.addr_string
-                ),
-            ));
-        }
-    }
-
-    loop {
-        futures::select! {
-            stream_result_opt = connections.next() => {
-                // A TcpStream ended. Print out some status and potentially reconnect to it.
-                match stream_result_opt {
-                    Some((result, route_addr)) => {
-                        let should_reconnect =
-                            match result {
-                                Ok(_) => {
-                                    eprintln!("Connection {} finished gracefully.", route_addr);
-                                    args.should_reconnect_on_graceful_close
-                                }
-                                Err(ref e) => {
-                                    eprintln!("Connection {} ended with result {}", route_addr, e);
-                                    args.should_reconnect_on_error
-                                }
-                            };
-
-                        // Every time a socket closes, it's possible it was because the router finished, so check to
-                        // make sure the router is still active before doing things like reconnecting.
-                        if !router.is_done {
-                            // Notify the router that a connection failed so it can clean it up. Possible that this happened
-                            // because the router itself closed the route, in which case this will have no effect.
-                            router.remove_route(&route_addr);
-
-                            // When reconnecting, just do another connection and add it to the list of ongoing connections
-                            // being tracked.
-                            if should_reconnect {
-                                match tcp_connect_to_candidate(&route_addr.peer, source_addrs, args).await {
-                                    Ok(tcp_stream) => {
-                                        // If we were able to connect to a candidate, add them to the router so they can
-                                        // send and receive traffic.
-                                        let (rx_socket, tx_socket) = tcp_stream.into_split();
-                                        let net_to_router_sink = router.add_route(tx_socket);
-                                        connections.push(handle_tcp_stream(
-                                            rx_socket,
-                                            args,
-                                            net_to_router_sink
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
-                                    }
-                                }
-                            }
-                        }
-
-                        // If at any time we have no connections left, then there's nothing else to do, so return.
-                        if connections.is_empty() {
-                            return result;
-                        }
-                    }
-                    None => return Ok(()),
-                }
-            },
-            _ = router.service().fuse() => {
-                panic!("Router exited early!");
-            }
-        };
-    }
-}
-
 async fn tcp_connect_to_candidate(
     addr: &SocketAddr,
     source_addrs: &SockAddrSet,
     args: &NcArgs,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    eprintln!("Connecting to {}", addr);
-
     let socket = if addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()
     } else {
@@ -1168,6 +1055,9 @@ async fn tcp_connect_to_candidate(
             std::io::ErrorKind::AddrNotAvailable,
             "No matching local address matched destination host's address family",
         ))?;
+
+    eprintln!("Connecting from {} to {}", source_addr, addr);
+
     socket.bind(*source_addr)?;
 
     let stream = socket.connect(*addr).await?;
@@ -1184,56 +1074,144 @@ async fn tcp_connect_to_candidate(
     Ok(stream)
 }
 
-fn get_local_addrs(
-    local_host_opt: Option<&str>,
-    local_port: u16,
-    af_limit: &AfLimit,
+async fn get_local_addrs(
+    local_addr_strings: impl Iterator<Item = &str>,
+    include_unspec_as_default: bool,
+    args: &NcArgs,
 ) -> std::io::Result<SockAddrSet> {
-    assert!(!af_limit.use_v4 || !af_limit.use_v6);
+    assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
-    // If the caller specified a specific address, include that. Otherwise, include all unspecified addresses.
-    let mut addrs = SockAddrSet::new();
+    let mut local_addrs = SockAddrSet::new();
 
-    if let Some(local_host) = local_host_opt {
-        addrs.insert(
-            format!("{}:{}", local_host, local_port)
-                .parse()
-                .or(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?,
-        );
-    } else {
-        addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
+    let mut did_lookup = false;
+    for addr_string in local_addr_strings {
+        did_lookup = true;
+        if args.verbose {
+            eprintln!("Looking up {}", addr_string);
+        }
+
+        // If this matches, then the user has passed * or *:NNNN and wants to use the wildcard address either with port
+        // 0 implicitly or with a specified port.
+        if let Some(captures) = WILDCARD_HOST_REGEX.captures_iter(addr_string).next() {
+            // Get the first capture if it's present, which is the port number.
+            let port_num = if let Some(port_match) = captures.get(1) {
+                // Unwrap is OK here because the regex validated that this is a number only.
+                port_match.as_str().parse::<u16>().unwrap()
+            } else {
+                0
+            };
+
+            local_addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                port_num,
+            )));
+
+            local_addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::UNSPECIFIED,
+                port_num,
+                0,
+                0,
+            )));
+        } else {
+            let addrs: SockAddrSet = tokio::net::lookup_host(&addr_string).await?.collect();
+            for addr in addrs.iter() {
+                if args.verbose {
+                    eprintln!("Resolved to {}", addr);
+                }
+
+                local_addrs.insert(*addr);
+            }
+        }
+    }
+
+    // The caller may optionally choose to default to including the wildcard local addresses if they didn't pass any
+    // specific one.
+    if !did_lookup && include_unspec_as_default {
+        local_addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::UNSPECIFIED,
-            local_port,
+            0,
         )));
 
-        addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
+        local_addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
             std::net::Ipv6Addr::UNSPECIFIED,
-            local_port,
+            0,
             0,
             0,
         )));
     }
 
     // If the caller specified only one address family, filter out any incompatible address families.
-    let addrs = addrs
+    let local_addrs = local_addrs
         .drain()
-        .filter(|e| !(af_limit.use_v4 && e.is_ipv6() || af_limit.use_v6 && e.is_ipv4()))
+        .filter(|e| !(args.af_limit.use_v4 && e.is_ipv6() || args.af_limit.use_v6 && e.is_ipv4()))
         .collect();
 
-    Ok(addrs)
+    Ok(local_addrs)
 }
 
-async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Result<()> {
+async fn do_tcp(
+    listen_addrs: &SockAddrSet,
+    outbound_source_addrs: &SockAddrSet,
+    targets: &[ConnectionTarget],
+    args: &NcArgs,
+) -> std::io::Result<()> {
+    let mut outbound_connections = FuturesUnordered::new();
+    let mut inbound_connections = FuturesUnordered::new();
     let mut listeners = vec![];
-    let mut clients = FuturesUnordered::new();
     let mut router = TcpRouter::new(args);
 
-    let max_clients = args.max_clients.unwrap();
+    let max_inbound_connections = args.max_inbound_connections.unwrap();
+
+    // For each user-specified target hostname:port combo, try to connect to all of the addresses it resolved to. When
+    // one successful connection is established, move on to the next target. Otherwise we'd end up sending duplicate
+    // traffic to the same host.
+    for target in targets.iter() {
+        let mut succeeded_all_connections = true;
+        for addr in target.addrs.iter() {
+            // Skip incompatible candidates from what address family the user specified.
+            if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
+                continue;
+            }
+
+            match tcp_connect_to_candidate(addr, outbound_source_addrs, args).await {
+                Ok(tcp_stream) => {
+                    // If we were able to connect to a candidate, add them to the router so they can send and receive
+                    // traffic.
+                    let (rx_socket, tx_socket) = tcp_stream.into_split();
+                    let net_to_router_sink = router.add_route(tx_socket);
+                    outbound_connections.push(handle_tcp_stream(
+                        rx_socket,
+                        args,
+                        net_to_router_sink,
+                    ));
+
+                    // Stop after first successful connection for this target.
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to {}. Error: {}", addr, e);
+                    succeeded_all_connections = false;
+                }
+            }
+        }
+
+        // Fail if we couldn't connect to any address for a given target, even if we successfully connected to another
+        // target.
+        if !succeeded_all_connections {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!(
+                    "Failed to connect to all candidates for {}",
+                    &target.addr_string
+                ),
+            ));
+        }
+    }
 
     loop {
         // If we ever aren't at maximum clients accepted, start listening on all the specified addresses in order to
         // accept new clients. Only do this if we aren't currently listening.
-        if listeners.is_empty() && clients.len() != max_clients {
+        if listeners.is_empty() && inbound_connections.len() != max_inbound_connections {
             // Map the listening addresses to a set of sockets, bind them, and listen on them.
             for listen_addr in listen_addrs.iter() {
                 let listening_socket = if listen_addr.is_ipv4() {
@@ -1254,10 +1232,10 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
 
                 listeners.push(listening_socket.listen(1)?);
             }
-        } else if !listeners.is_empty() && clients.len() == max_clients {
+        } else if !listeners.is_empty() && inbound_connections.len() == max_inbound_connections {
             eprintln!(
                 "Not accepting further clients (max {}). Closing listening sockets.",
-                max_clients
+                max_inbound_connections
             );
 
             // Removing the listening sockets stops the machine from allowing the connection. Remote machines that try
@@ -1285,11 +1263,11 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                         // At the same time, make it known to the router so it can service traffic to and from it.
                         let (rx_socket, tx_socket) = tcp_stream.into_split();
                         let net_to_router_sink = router.add_route(tx_socket);
-                        clients.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
+                        inbound_connections.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
                     }
                     Err(e) => {
                         // If there was an error accepting a connection, bail out if the user asked to listen only once.
-                        if !args.is_listening_repeatedly {
+                        if args.listen_many.is_empty() {
                             eprintln!("Failed to accept an incoming connection. {}", e);
                             return Err(e);
                         } else {
@@ -1298,7 +1276,7 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                     }
                 }
             },
-            (stream_result, route_addr) = clients.select_next_some() => {
+            (stream_result, route_addr) = inbound_connections.select_next_some() => {
                 match stream_result {
                     Ok(_) => {
                         eprintln!("Connection {} closed gracefully.", route_addr);
@@ -1311,17 +1289,71 @@ async fn do_tcp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
                 // After handling a client, either loop and accept another client or exit, depending on the user's
                 // choice. There are two reasons to exit: the user asked to listen only one time, or the router has shut
                 // down.
-                if !args.is_listening_repeatedly || router.is_done {
+                if args.listen_many.is_empty() || router.is_done {
                     return stream_result;
                 }
 
                 // Notify the router that a connection failed so it can clean it up.
                 router.remove_route(&route_addr);
             },
+            (result, route_addr) = outbound_connections.select_next_some() => {
+                // A TcpStream ended. Print out some status and potentially reconnect to it.
+                let should_reconnect =
+                    match result {
+                        Ok(_) => {
+                            eprintln!("Connection {} finished gracefully.", route_addr);
+                            args.should_reconnect_on_graceful_close
+                        }
+                        Err(ref e) => {
+                            eprintln!("Connection {} ended with result {}", route_addr, e);
+                            args.should_reconnect_on_error
+                        }
+                    };
+
+                // Every time a socket closes, it's possible it was because the router finished, so check to
+                // make sure the router is still active before doing things like reconnecting.
+                if !router.is_done {
+                    // Notify the router that a connection failed so it can clean it up. Possible that this happened
+                    // because the router itself closed the route, in which case this will have no effect.
+                    router.remove_route(&route_addr);
+
+                    // When reconnecting, just do another connection and add it to the list of ongoing connections
+                    // being tracked.
+                    if should_reconnect {
+                        match tcp_connect_to_candidate(&route_addr.peer, outbound_source_addrs, args).await {
+                            Ok(tcp_stream) => {
+                                // If we were able to connect to a candidate, add them to the router so they can
+                                // send and receive traffic.
+                                let (rx_socket, tx_socket) = tcp_stream.into_split();
+                                let net_to_router_sink = router.add_route(tx_socket);
+                                outbound_connections.push(handle_tcp_stream(
+                                    rx_socket,
+                                    args,
+                                    net_to_router_sink
+                                ));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
+                            }
+                        }
+                    }
+                }
+            },
             _ = router.service().fuse() => {
                 panic!("Router exited early!");
             },
         };
+
+        // If there is no work to do on any current connections and we aren't in repeated listening mode (which would
+        // cause us to imminently start listening again), then there's nothing left to do and we should exit.
+        if args.listen_many.is_empty()
+            && inbound_connections.is_empty()
+            && outbound_connections.is_empty()
+            && listeners.is_empty()
+            && accepts.is_empty()
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -1392,9 +1424,10 @@ async fn bind_udp_sockets(
     Ok(listening_sockets)
 }
 
-async fn do_udp_connection(
-    targets: &Vec<ConnectionTarget>,
-    source_addrs: &SockAddrSet,
+async fn do_udp(
+    listen_addrs: &SockAddrSet,
+    outbound_source_addrs: &SockAddrSet,
+    targets: &[ConnectionTarget],
     args: &NcArgs,
 ) -> std::io::Result<()> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
@@ -1415,7 +1448,7 @@ async fn do_udp_connection(
     }
 
     // Filter the source address list to only ones that match the address families of any candidates being used.
-    let source_addrs: SockAddrSet = source_addrs
+    let mut bind_addrs: SockAddrSet = outbound_source_addrs
         .iter()
         .filter_map(|e| {
             if (e.is_ipv4() && has_ipv4) || (e.is_ipv6() && has_ipv6) {
@@ -1426,7 +1459,10 @@ async fn do_udp_connection(
         })
         .collect();
 
-    if source_addrs.is_empty() {
+    // To get the whole list of addresses to bind to, add in all the ones the user specified to listen on.
+    bind_addrs.extend(listen_addrs.iter());
+
+    if bind_addrs.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
             "No suitable local address for remote peers.",
@@ -1434,7 +1470,7 @@ async fn do_udp_connection(
     }
 
     // Bind to all the source addresses that are needed.
-    let sockets = bind_udp_sockets(&source_addrs, args).await?;
+    let sockets = bind_udp_sockets(&bind_addrs, args).await?;
 
     assert!(!sockets.is_empty());
 
@@ -1462,7 +1498,7 @@ async fn do_udp_connection(
         }
     }
 
-    if candidates.is_empty() {
+    if listen_addrs.is_empty() && candidates.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
             "No suitable remote peers found.",
@@ -1483,12 +1519,7 @@ async fn do_udp_connection(
         }
     }
 
-    handle_udp_sockets(&sockets, Some(&candidates), args).await
-}
-
-async fn do_udp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Result<()> {
-    let listeners = bind_udp_sockets(listen_addrs, args).await?;
-    handle_udp_sockets(&listeners, None, args).await
+    handle_udp_sockets(&sockets, &candidates, args).await
 }
 
 // Route traffic between local machine and multiple UDP peers. The way UDP sockets work, we bind to local sockets and
@@ -1497,7 +1528,7 @@ async fn do_udp_listen(listen_addrs: &SockAddrSet, args: &NcArgs) -> std::io::Re
 // to achieve the same thing.
 async fn handle_udp_sockets(
     sockets: &Vec<Arc<tokio::net::UdpSocket>>,
-    initial_routes_opt: Option<&RouteAddrSet>,
+    initial_routes: &RouteAddrSet,
     args: &NcArgs,
 ) -> std::io::Result<()> {
     fn print_udp_assoc(route_addr: &RouteAddr) {
@@ -1582,28 +1613,25 @@ async fn handle_udp_sockets(
 
     let mut channels = ChannelMap::new();
 
-    // For outbound UDP scenarios, the caller will pass in the first set of routes--remote peers and which local socket
-    // to use to send to that peer. For inbound scenarios, the remote peers aren't known until they send traffic here
-    // first.
-    if let Some(initial_routes) = initial_routes_opt {
-        for route in initial_routes.iter() {
-            print_udp_assoc(&route);
-            let added = known_routes.insert(route.clone());
-            assert!(added);
-            lifetime_client_count += 1;
+    // The user may specify a set of initial peers to be aware of and send traffic to. That is typical of outbound
+    // scenarios. For inbound-only scenarios, no initial peers are specified because they aren't known yet.
+    for route in initial_routes.iter() {
+        print_udp_assoc(&route);
+        let added = known_routes.insert(route.clone());
+        assert!(added);
+        lifetime_client_count += 1;
 
-            if args.is_using_channels() {
-                channels.add_route(route, known_routes.iter());
-            }
+        if args.is_using_channels() {
+            channels.add_route(route, known_routes.iter());
+        }
 
-            if lifetime_client_count == 1 {
-                // Since we have a remote peer hooked up, start processing local IO.
-                let (local_io_sink, local_io_stream2) = setup_local_io(args);
-                local_io_stream = local_io_stream2;
+        if lifetime_client_count == 1 {
+            // Since we have a remote peer hooked up, start processing local IO.
+            let (local_io_sink, local_io_stream2) = setup_local_io(args);
+            local_io_stream = local_io_stream2;
 
-                assert!(local_io_sink_opt.is_none());
-                local_io_sink_opt = Some(local_io_sink);
-            }
+            assert!(local_io_sink_opt.is_none());
+            local_io_sink_opt = Some(local_io_sink);
         }
     }
 
@@ -1856,9 +1884,22 @@ struct RandConfig {
 }
 
 #[derive(clap::Parser, Clone)]
-#[command(author, version, about, long_about = None, disable_help_flag = true, override_usage =
-r#"connect outbound: nc [options] host:port[xMult] [host:port[xMult] ...]
-       listen for inbound: nc [-l | -L] -p port [options]"#)]
+#[command(
+author,
+version,
+about,
+long_about = None,
+disable_help_flag = true,
+override_usage =
+r#"connect outbound: nc [options] HOST:PORT[xMult] [HOST:PORT[xMult] ...]
+       listen for inbound: nc [[-l | -L] ADDR:PORT ...] [options]"#,
+after_help =
+r#"For -l, -L, and -s, a few formats of ADDR:PORT are supported:
+- HOST:PORT - standard format, anything that can be parsed as a local address, including DNS lookup
+- :PORT - automatically enumerates all local addresses
+- *:PORT - uses the wildcard IPv4 and IPv6 addresses (0.0.0.0 and [::]) with the specified port
+- * - same as above but implicitly use port 0"#
+)]
 pub struct NcArgs {
     /// this cruft (--help for long help)
     #[arg(short = 'h')]
@@ -1871,26 +1912,22 @@ pub struct NcArgs {
     #[arg(short = 'u')]
     is_udp: bool,
 
-    /// Listen for incoming connections
-    #[arg(short = 'l')]
-    is_listening: bool,
+    /// Listen for incoming connections and exit after servicing first client. Can be specified multiple times to listen on different addresses. See notes below too.
+    #[arg(short = 'l', value_name = "ADDR:PORT")]
+    listen_once: Vec<String>,
 
-    /// Listen repeatedly for incoming connections (implies -l)
-    #[arg(short = 'L')]
-    is_listening_repeatedly: bool,
+    /// Listen repeatedly for incoming connections
+    /// Listen repeatedly for incoming connections. Can be specified multiple times to listen on different addresses. See notes below too.
+    #[arg(short = 'L', value_name = "ADDR:PORT", conflicts_with = "listen_once")]
+    listen_many: Vec<String>,
 
     /// Max incoming clients allowed to be connected at the same time. (TCP only).
     #[arg(short = 'm', conflicts_with = "is_udp")]
-    max_clients: Option<usize>,
+    max_inbound_connections: Option<usize>,
 
-    /// Source address to bind to
-    #[arg(short = 's')]
-    source_host: Option<String>,
-
-    // Unspecified local port uses port 0, which when bound to assigns from the ephemeral port range.
-    /// Port to bind to
-    #[arg(short = 'p', default_value_t = 0)]
-    source_port: u16,
+    /// Source address to bind to for outbound connections
+    #[arg(short = 's', value_name = "ADDR:PORT")]
+    outbound_source_host_opt: Option<String>,
 
     /// Forwarding mode
     #[arg(short = 'f', long = "fm", value_enum, default_value_t = ForwardingMode::Null)]
@@ -1963,15 +2000,15 @@ pub struct NcArgs {
     verbose: bool,
 
     /// Host:Port pairs to connect to. Can optionally add e.g. x10, to connect to that target 10 times.
-    #[arg(
-        value_name = "HOST:PORT[xMULT]",
-        conflicts_with = "is_listening",
-        conflicts_with = "is_listening_repeatedly"
-    )]
+    #[arg(value_name = "HOST:PORT[xMULT]")]
     targets: Vec<String>,
 }
 
 impl NcArgs {
+    fn is_listening(&self) -> bool {
+        !self.listen_once.is_empty() || !self.listen_many.is_empty()
+    }
+
     fn is_using_channels(&self) -> bool {
         match self.forwarding_mode {
             ForwardingMode::Channels | ForwardingMode::LingerChannels => true,
@@ -1996,10 +2033,6 @@ async fn main() -> Result<(), String> {
         std::process::exit(1)
     }
 
-    if args.is_listening_repeatedly {
-        args.is_listening = true;
-    }
-
     // If a user is redirecting stdout to a file, then stdin typically starts off at EOF, which makes the local stream
     // end too quickly, so override the input mode to just hang and allow the output to proceed.
     //
@@ -2018,11 +2051,11 @@ async fn main() -> Result<(), String> {
         _ => {}
     }
 
-    // If max_clients wasn't specified explicitly, set its value automatically. If in broker or channel mode, you
-    // generally want more than one incoming client at a time, or else why are you in a forwarding mode?? Otherwise,
-    // safely limit to just one at a time.
-    if args.max_clients.is_none() {
-        args.max_clients = Some(match args.forwarding_mode {
+    // If max_inbound_connections wasn't specified explicitly, set its value automatically. If in broker or channel
+    // mode, you generally want more than one incoming client at a time, or else why are you in a forwarding mode??
+    // Otherwise, safely limit to just one at a time.
+    if args.max_inbound_connections.is_none() {
+        args.max_inbound_connections = Some(match args.forwarding_mode {
             ForwardingMode::Null => 1,
             ForwardingMode::Broker | ForwardingMode::Channels | ForwardingMode::LingerChannels => {
                 10
@@ -2040,7 +2073,7 @@ async fn main() -> Result<(), String> {
 
             // Check and see if the user appended x123 or whatever as a multiplier at the end of the target string.
             if let Some(captures) = TARGET_MULTIPLIER_REGEX.captures_iter(&target).next() {
-                // Capture 0 is the entire matched text, so the part from the start up to the first matched
+                // Capture 0 is the entire matched text, so the part from the start up to the first captured
                 // character is the "before" portion.
                 let before_match = &target[..captures.get(0).unwrap().start()];
 
@@ -2065,46 +2098,54 @@ async fn main() -> Result<(), String> {
         }
     }
 
+    if !args.is_listening() && targets.is_empty() {
+        usage("Need host:port to connect to!");
+    }
+
     // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
     // bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to, choose the
     // outbound multicast port because it's probably what they actually wanted.
-    if args.should_join_multicast_group && args.source_port == 0 {
+    if args.should_join_multicast_group && args.outbound_source_host_opt.is_none() {
         if let Some(first_target) = &targets.first() {
             if let Some(first_target_addr) = &first_target.addrs.iter().take(1).next() {
-                args.source_port = first_target_addr.port();
+                args.outbound_source_host_opt = Some(format!("*:{}", first_target_addr.port()));
             }
         }
     }
 
-    // Converts Option<String> -> Option<&str>
-    let source_host_opt = args.source_host.as_deref();
+    // Option::iter() makes an iterator that yields either 0 or 1 item, depending on if it's None or Some.
+    // The `true` param for get_local_addrs tells it to automatically include the wildcard local address if no source
+    // addresses were explicitly specified.
+    let outbound_source_addrs = get_local_addrs(
+        args.outbound_source_host_opt
+            .iter()
+            .map(|s: &String| s.as_str()),
+        true,
+        &args,
+    )
+    .await
+    .map_err(format_io_err)?;
 
-    // Common code for getting the source addresses to use, but put into a closure to call it later, only after
-    // parameter validation is successful.
-    let make_source_addrs = || {
-        get_local_addrs(source_host_opt, args.source_port, &args.af_limit).map_err(format_io_err)
+    // Should be handled by the conflicts_with attribute above.
+    assert!(args.listen_once.is_empty() || args.listen_many.is_empty());
+
+    let listen_addr_strings = if !args.listen_once.is_empty() {
+        &args.listen_once
+    } else {
+        &args.listen_many
     };
 
-    let result = if args.is_listening {
-        let source_addrs = make_source_addrs()?;
+    // If the user didn't pass `-l` or `-L`, then we shouldn't listen on any addresses. Pass `false` to get_local_addrs
+    // to prevent it from automatically including the wildcard local addresses.
+    let listen_addrs =
+        get_local_addrs(listen_addr_strings.iter().map(|s| s.as_str()), false, &args)
+            .await
+            .map_err(format_io_err)?;
 
-        if args.is_udp {
-            do_udp_listen(&source_addrs, &args).await
-        } else {
-            do_tcp_listen(&source_addrs, &args).await
-        }
+    let result = if args.is_udp {
+        do_udp(&listen_addrs, &outbound_source_addrs, &targets, &args).await
     } else {
-        if targets.is_empty() {
-            usage("Need host:port to connect to!");
-        }
-
-        let source_addrs = make_source_addrs()?;
-
-        if args.is_udp {
-            do_udp_connection(&targets, &source_addrs, &args).await
-        } else {
-            do_tcp_connect(&targets, &source_addrs, &args).await
-        }
+        do_tcp(&listen_addrs, &outbound_source_addrs, &targets, &args).await
     };
 
     result.map_err(format_io_err)
