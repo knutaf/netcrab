@@ -35,7 +35,7 @@ The `ADDR:PORT` syntax supports some special variants:
 - \*:*PORT* - uses the wildcard IPv4 and IPv6 addresses (0.0.0.0 and [::]) with the specified port. E.g. `*:5000`
 - \* - same as above but implicitly use port 0
 
-The TCP server by default only allows a single incoming connection to be active at a time, but the `-m max_inbound_clients` flag allows more than one to connect.
+The TCP server by default only allows a single incoming connection to be active at a time per listening address, but the `-m max_inbound_clients` flag allows more than one to connect.
 
 As with client mode, stdin is sent to all connected sockets, and incoming data from all sockets is sent to stdout. This can be changed using the input and output mode arguments below.
 
@@ -161,16 +161,16 @@ Now we get to the really useful parts. Netcrab can turn into a router, forwardin
 
 The first and second channels pass all the way through but don't cross the streams. If Host 1 or Host 3 disconnects an endpoint, the disconnection is "forwarded" to the other end of the channel too. If that behavior doesn't work for you, you can switch to Lingering Channels mode.
 
-When in channels mode, max clients is automatically bumped to 10 under the assumption that the user probably wants more than one connection at a time in order to actually, you know, use the channels. This can be overridden with `-m`.
+When in channels mode, max clients is automatically bumped to 10 per listening address under the assumption that the user probably wants more than one connection at a time in order to actually, you know, use the channels. This can be overridden with `-m`.
 
-## Broker mode
+## Hub mode
 
-`netcrab --fm broker`
+`netcrab --fm hub`
 
-Broker mode is similar to channels mode, but simpler: all traffic from all network sources is forwarded back to all other sockets. You could use it to set up a chat room or something.
+Hub mode is similar to channels mode, but simpler: all traffic from all network sources is forwarded back to all other sockets. You could use it to set up a chat room or something.
 
-As in channels mode, when in broker mode, max clients is automatically bumped to 10 but can be overridden with `-m`.
+As in channels mode, when in hub mode, max clients is automatically bumped to 10 per listening address but can be overridden with `-m`.
 
 ## Endless possibilities
 
-Pretty much all of the capabilities described above can be combined and used at the same time. For example, listening on multiple addresses and connecting to multiple targets in the same session while brokering all the connections can be done.
+Pretty much all of the capabilities described above can be combined and used at the same time. For example, you can listen on multiple addresses and connect to multiple targets in the same session while using hub to forward between all the connections.

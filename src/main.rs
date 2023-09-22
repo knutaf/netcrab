@@ -240,16 +240,16 @@ fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> b
         return false;
     }
 
-    // When brokering, any incoming traffic should be sent back to all other peers.
-    // When not brokering, only send to the local output or back to the source (only possible in
+    // When in hub mode, any incoming traffic should be sent back to all other peers.
+    // When not in hub mode, only send to the local output or back to the source (only possible in
     // echo mode).
-    if args.forwarding_mode != ForwardingMode::Broker
+    if args.forwarding_mode != ForwardingMode::Hub
         && (dest != source)
         && *dest != LOCAL_IO_PEER_ADDR
         && *source != LOCAL_IO_PEER_ADDR
     {
         if args.verbose {
-            eprintln!("Skipping forwarding to other remote endpoint due to not broker mode.");
+            eprintln!("Skipping forwarding to other remote endpoint due to not hub mode.");
         }
 
         return false;
@@ -549,7 +549,7 @@ impl<'a> TcpRouter<'a> {
                     }
 
                     // If no send happened from channels earlier, try again with regular routing. We shouldn't be in
-                    // both broker mode and channel mode, so mostly this covers making sure local input can be sent out,
+                    // both hub mode and channel mode, so mostly this covers making sure local input can be sent out,
                     // since it isn't associated with any channel.
                     if !did_send {
                         // Broadcast any incoming data back to whichever other connected sockets and/or local IO it
@@ -1039,14 +1039,6 @@ async fn tcp_connect_to_candidate(
     source_addrs: &SockAddrSet,
     args: &NcArgs,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let socket = if addr.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()
-    } else {
-        tokio::net::TcpSocket::new_v6()
-    }?;
-
-    configure_socket_options(&socket, addr.is_ipv4(), args)?;
-
     // Bind the local socket to any local address that matches the address family of the destination.
     let source_addr = source_addrs
         .iter()
@@ -1057,6 +1049,14 @@ async fn tcp_connect_to_candidate(
         ))?;
 
     eprintln!("Connecting from {} to {}", source_addr, addr);
+
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }?;
+
+    configure_socket_options(&socket, addr.is_ipv4(), args)?;
 
     socket.bind(*source_addr)?;
 
@@ -1166,7 +1166,7 @@ async fn do_tcp(
     // one successful connection is established, move on to the next target. Otherwise we'd end up sending duplicate
     // traffic to the same host.
     for target in targets.iter() {
-        let mut succeeded_all_connections = true;
+        let mut succeeded_any_connection = false;
         for addr in target.addrs.iter() {
             // Skip incompatible candidates from what address family the user specified.
             if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
@@ -1186,24 +1186,21 @@ async fn do_tcp(
                     ));
 
                     // Stop after first successful connection for this target.
+                    succeeded_any_connection = true;
                     break;
                 }
                 Err(e) => {
                     eprintln!("Failed to connect to {}. Error: {}", addr, e);
-                    succeeded_all_connections = false;
                 }
             }
         }
 
         // Fail if we couldn't connect to any address for a given target, even if we successfully connected to another
         // target.
-        if !succeeded_all_connections {
+        if !succeeded_any_connection {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
-                format!(
-                    "Failed to connect to all candidates for {}",
-                    &target.addr_string
-                ),
+                format!("Failed to connect to {}", &target.addr_string),
             ));
         }
     }
@@ -1717,7 +1714,7 @@ async fn handle_udp_sockets(
                 }
 
                 // If no send happened from channels earlier, try again with regular routing. We shouldn't be in both
-                // broker mode and channel mode, so mostly this covers making sure local input can be sent out, since
+                // hub mode and channel mode, so mostly this covers making sure local input can be sent out, since
                 // it isn't associated with any channel.
                 //
                 // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should go
@@ -1804,7 +1801,7 @@ struct AfLimit {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 enum InputMode {
     /// No input
-    #[value(name = "none", alias = "no")]
+    #[value(name = "none", alias = "n")]
     Null,
 
     /// Read from stdin
@@ -1833,7 +1830,7 @@ enum OutputMode {
     Stdout,
 
     /// No output
-    #[value(name = "none", alias = "no")]
+    #[value(name = "none", alias = "n")]
     Null,
 }
 
@@ -1843,9 +1840,9 @@ enum ForwardingMode {
     #[value(name = "none")]
     Null,
 
-    /// Broker mode: forward traffic between connected clients. Automatically sets -m 10.
-    #[value(name = "broker", alias = "b")]
-    Broker,
+    /// Hub mode: forward traffic between connected clients. Automatically sets -m 10.
+    #[value(name = "hub", alias = "h")]
+    Hub,
 
     /// Channel mode: automatically group pairs of remote addresses from different IP addresses into "channels" and forward traffic between the two endpoints, but not between different channels. If one end of a channel disconnects, it automatically disconnects the other end too. This disconnection part has no effect with UDP. Automatically sets -m 10.
     #[value(name = "channels", alias = "c")]
@@ -1970,7 +1967,7 @@ pub struct NcArgs {
     output_mode: OutputMode,
 
     /// Exit after input completes (e.g. after stdin EOF)
-    #[arg(long = "exit-after-input")]
+    #[arg(long = "exit-after-input", alias = "eai")]
     should_exit_after_input_closed: bool,
 
     /// Join multicast group given by hostname (outbound UDP only)
@@ -2051,18 +2048,6 @@ async fn main() -> Result<(), String> {
         _ => {}
     }
 
-    // If max_inbound_connections wasn't specified explicitly, set its value automatically. If in broker or channel
-    // mode, you generally want more than one incoming client at a time, or else why are you in a forwarding mode??
-    // Otherwise, safely limit to just one at a time.
-    if args.max_inbound_connections.is_none() {
-        args.max_inbound_connections = Some(match args.forwarding_mode {
-            ForwardingMode::Null => 1,
-            ForwardingMode::Broker | ForwardingMode::Channels | ForwardingMode::LingerChannels => {
-                10
-            }
-        });
-    }
-
     let mut targets: Vec<ConnectionTarget> = vec![];
 
     if !args.targets.is_empty() {
@@ -2141,6 +2126,21 @@ async fn main() -> Result<(), String> {
         get_local_addrs(listen_addr_strings.iter().map(|s| s.as_str()), false, &args)
             .await
             .map_err(format_io_err)?;
+
+    // If max_inbound_connections wasn't specified explicitly, set its value automatically. If in hub or channel
+    // mode, you generally want more than one incoming client at a time, or else why are you in a forwarding mode??
+    // Otherwise, safely limit to just one per user-specified listen address at a time.
+    if args.max_inbound_connections.is_none() {
+        args.max_inbound_connections = Some(
+            listen_addr_strings.len()
+                * match args.forwarding_mode {
+                    ForwardingMode::Null => 1,
+                    ForwardingMode::Hub
+                    | ForwardingMode::Channels
+                    | ForwardingMode::LingerChannels => 10,
+                },
+        );
+    }
 
     let result = if args.is_udp {
         do_udp(&listen_addrs, &outbound_source_addrs, &targets, &args).await
