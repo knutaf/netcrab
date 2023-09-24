@@ -51,7 +51,7 @@ UDP is weird in that you don't really "connect" with it. You bind to a local por
 
 For `-L` this supports the same `ADDR:PORT` syntax as above for TCP.
 
-Datagram size defaults to 1 byte but can be controlled by the `--sb` argument.
+Datagram size defaults to 1 byte but can be controlled by the `--ss` argument.
 
 ## Listening on multiple local sockets
 
@@ -82,7 +82,7 @@ The input mode can be controlled. By default, input comes from stdin. It accepts
 - `stdin-nochar`: works the same as stdin, but doesn't engage "character mode". This works worse for interactive uses.
 - `echo`: any received traffic will be echoed back to its sender.
 - `rand`: random data will be generated. The random sizes of data can be controlled by `--rsizemin` and `--rsizemax`, and the type of data can be controlled by `--rvals`.
-- `fixed`: only really useful for perf testing. The same fixed-size message with fixed data will be sent infinitely. You can control the size using `--sb` and the type of random data in it with `--rvals`
+- `fixed`: only really useful for perf testing. The same fixed-size message with fixed data will be sent infinitely. You can control the size using `--ss` and the type of random data in it with `--rvals`
 
 When using one of the stdin modes as input, you can specify `--exit-after-input` to quit the program after the input stream reaches end of file.
 
@@ -170,6 +170,14 @@ When in channels mode, max clients is automatically bumped to 10 per listening a
 Hub mode is similar to channels mode, but simpler: all traffic from all network sources is forwarded back to all other sockets. You could use it to set up a chat room or something.
 
 As in channels mode, when in hub mode, max clients is automatically bumped to 10 per listening address but can be overridden with `-m`.
+
+## Command execution
+
+`netcrab -e COMMAND`
+
+Netcrab can execute another program and connect up its stdin and stdout to the network. Could easily use it to expose a remote shell or something, though of course you'll want to be careful with that. In this mode, the regular input and output will be disabled.
+
+The command string is run through the current shell.
 
 ## Endless possibilities
 

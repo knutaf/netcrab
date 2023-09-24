@@ -1,6 +1,7 @@
 // For AsFd/AsSocket shenanigans.
 #![feature(trait_alias)]
 
+extern crate execute;
 extern crate regex;
 
 use bytes::Bytes;
@@ -11,7 +12,7 @@ use regex::Regex;
 use std::{
     collections::HashMap,
     collections::HashSet,
-    io::{IsTerminal, Read, Write},
+    io::{IsTerminal, Write},
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -670,19 +671,26 @@ fn setup_local_output(args: &NcArgs) -> LocalIoSink {
 //
 // This isn't very nice for interactive uses. Instead, we can set up a separate thread for the blocking stdin read.
 // If the remote socket closes then this thread can be exited without having to wait for the async operation to finish.
-fn setup_async_stdin_reader_thread(
-    chunk_size: u32,
-    input_mode: InputMode,
-) -> mpsc::UnboundedReceiver<std::io::Result<Bytes>> {
+//
+// Turns out this strategy works well for both stdin itself and other synchronous Read implementors, such as a child
+// process stdout.
+fn setup_async_reader_thread<TInput>(
+    mut input_reader: TInput,
+    args: &NcArgs,
+) -> mpsc::UnboundedReceiver<std::io::Result<Bytes>>
+where
+    TInput: std::io::Read + std::marker::Send + 'static,
+{
     // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
     let (mut tx_input, rx_input) = mpsc::unbounded();
 
     // If the user is interactively using the program, by default use "character mode", which inputs a character on
     // every keystroke rather than a full line when hitting enter. However, the user can request to use normal stdin
-    // mode.
-    let is_char_mode = std::io::stdin().is_terminal() && (input_mode != InputMode::StdinNoCharMode);
+    // mode, and if this is reading from a child program execution, that definitely can't use character mode.
+    let is_interactive_mode = args.is_interactive_input_mode();
+    let chunk_size = args.send_size;
 
-    std::thread::Builder::new()
+    let _thread = std::thread::Builder::new()
         .name("stdin_reader".to_string())
         .spawn(move || {
             // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size
@@ -693,7 +701,7 @@ fn setup_async_stdin_reader_thread(
             // The available buffer (pointer to next byte to write and remaining available space in the chunk).
             let mut available_buf = &mut read_buf[..];
 
-            if is_char_mode {
+            if is_interactive_mode {
                 // The console crate has a function called stdout that gives you, uh, a Term object that also services
                 // input. OK dude.
                 let mut stdio = console::Term::stdout();
@@ -754,38 +762,70 @@ fn setup_async_stdin_reader_thread(
                     }
                 }
             } else {
-                let mut stdin = std::io::stdin();
-
-                while let Ok(num_bytes_read) = stdin.read(available_buf) {
-                    if num_bytes_read == 0 {
-                        // EOF. Disconnect from the channel too.
-                        tx_input.disconnect();
-                        break;
-                    }
-
-                    assert!(num_bytes_read <= available_buf.len());
-
-                    // We've accumulated a full chunk, so send it now.
-                    if num_bytes_read == available_buf.len() {
-                        if let Err(_) =
-                            tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
-                        {
+                loop {
+                    if let Ok(num_bytes_read) = input_reader.read(available_buf) {
+                        if num_bytes_read == 0 {
+                            // EOF. Disconnect from the channel too.
+                            tx_input.disconnect();
                             break;
                         }
 
-                        // The chunk was sent. Reset the buffer to allow storing the next chunk.
-                        available_buf = &mut read_buf[..];
-                    } else {
-                        // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
-                        // portion that was written to.
-                        available_buf = &mut available_buf[num_bytes_read..];
+                        assert!(num_bytes_read <= available_buf.len());
+
+                        // We've accumulated a full chunk, so send it now.
+                        if num_bytes_read == available_buf.len() {
+                            if let Err(_) =
+                                tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
+                            {
+                                eprintln!("breaking 1");
+                                break;
+                            }
+
+                            // The chunk was sent. Reset the buffer to allow storing the next chunk.
+                            available_buf = &mut read_buf[..];
+                        } else {
+                            // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
+                            // portion that was written to.
+                            available_buf = &mut available_buf[num_bytes_read..];
+                        }
                     }
                 }
             }
         })
-        .expect("Failed to create stdin reader thread");
+        .expect("Failed to create input reader thread");
 
     rx_input
+}
+
+// Return a sink and create a thread that writes everything from that sink to the specified writer.
+fn setup_async_writer_thread<TOutput>(mut output_sink: TOutput) -> LocalIoSink
+where
+    TOutput: std::io::Write + std::marker::Send + 'static,
+{
+    let (sink, mut stream) = mpsc::unbounded::<Bytes>();
+    let sink = sink.sink_map_err(map_unbounded_sink_err_to_io_err);
+    let sink_ret = sink.clone();
+
+    std::thread::Builder::new()
+        .name("output_writer".to_string())
+        .spawn(move || {
+            futures::executor::block_on(async {
+                loop {
+                    match stream.next().await {
+                        Some(bytes) => {
+                            output_sink.write_all(&bytes)?;
+                        }
+                        None => {
+                            eprintln!("Output closed.");
+                            return std::io::Result::Ok(());
+                        }
+                    }
+                }
+            })
+        })
+        .expect("Failed to create writer thread");
+
+    Box::pin(sink_ret)
 }
 
 // An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
@@ -871,22 +911,31 @@ impl Iterator for FixedBytesIter {
 }
 
 fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
+    if let Some(command) = args.exec_command_opt.as_ref() {
+        // Pipe stdin and stdout from the child process here so it can be wired up to the network.
+        let mut prog = execute::shell(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("Failed to execute command");
+
+        return (
+            Box::pin(setup_async_writer_thread(prog.stdin.take().unwrap())),
+            Box::pin(setup_async_reader_thread(prog.stdout.take().unwrap(), args)),
+        );
+    }
+
     match args.input_mode {
         InputMode::Null => (
             setup_local_output(args),
             Box::pin(futures::stream::pending()),
         ),
-        InputMode::Stdin | InputMode::StdinNoCharMode => {
-            // When using TCP, read a byte at a time to send as fast as possible. When using UDP, use the user's requested size
-            // to produce datagrams of the correct size.
-            let chunk_size = if args.is_udp { args.sendbuf_size } else { 1 };
-
-            (
-                setup_local_output(args),
-                // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
-                Box::pin(setup_async_stdin_reader_thread(chunk_size, args.input_mode)),
-            )
-        }
+        InputMode::Stdin | InputMode::StdinNoCharMode => (
+            setup_local_output(args),
+            // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
+            Box::pin(setup_async_reader_thread(std::io::stdin(), args)),
+        ),
 
         // Echo mode doesn't have a stream that produces data for sending. That will come directly from the sockets that
         // send data to this machine. It's handled in the routing code.
@@ -899,16 +948,16 @@ fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
             local_io_stream_from_iter(RandBytesIter::new(&args.rand_config)),
         ),
         InputMode::Fixed => (setup_local_output(args), {
-            // Create a random buffer of the size requested by sendbuf_size and containing data that matches the
+            // Create a random buffer of the size requested by send_size and containing data that matches the
             // user's requested random values configuration.
             let conf = RandConfig {
-                size_min: args.sendbuf_size as usize,
-                size_max: args.sendbuf_size as usize,
+                size_min: args.send_size as usize,
+                size_max: args.send_size as usize,
                 vals: args.rand_config.vals,
             };
 
             let fixed_buf = RandBytesIter::new(&conf).next().unwrap().unwrap();
-            assert!(fixed_buf.len() == args.sendbuf_size as usize);
+            assert!(fixed_buf.len() == args.send_size as usize);
 
             // Return a stream that will just keep producing that same fixed buffer forever.
             local_io_stream_from_iter(FixedBytesIter::new(fixed_buf))
@@ -952,8 +1001,13 @@ where
         }
     }
 
-    s2.set_send_buffer_size(args.sendbuf_size as usize)?;
-    s2.set_recv_buffer_size(args.recvbuf_size as usize)?;
+    if let Some(sendbuf_size) = args.sendbuf_size_opt {
+        s2.set_send_buffer_size(sendbuf_size as usize)?;
+    }
+
+    if let Some(recvbuf_size) = args.recvbuf_size_opt {
+        s2.set_recv_buffer_size(recvbuf_size as usize)?;
+    }
 
     // If joining a multicast group, the TTL param was used above for the multicast TTL. Don't set it as the unicast
     // TTL too.
@@ -1938,13 +1992,17 @@ pub struct NcArgs {
     #[arg(short = 'R', requires = "targets", conflicts_with = "is_udp")]
     should_reconnect_on_error: bool,
 
-    /// Send buffer/datagram size
-    #[arg(long = "sb", default_value_t = 1)]
-    sendbuf_size: u32,
+    /// Send size (affects input chunk size and UDP datagram size)
+    #[arg(long = "ss", default_value_t = 1)]
+    send_size: u32,
+
+    /// Send buffer size
+    #[arg(long = "sb")]
+    sendbuf_size_opt: Option<u32>,
 
     /// Recv buffer size
-    #[arg(long = "rb", default_value_t = 65536)]
-    recvbuf_size: u32,
+    #[arg(long = "rb")]
+    recvbuf_size_opt: Option<u32>,
 
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
@@ -1969,6 +2027,10 @@ pub struct NcArgs {
     /// Exit after input completes (e.g. after stdin EOF)
     #[arg(long = "exit-after-input", alias = "eai")]
     should_exit_after_input_closed: bool,
+
+    /// Connect local input and output to an executed program
+    #[arg(short = 'e', long = "exec", value_name = "COMMAND")]
+    exec_command_opt: Option<String>,
 
     /// Join multicast group given by hostname (outbound UDP only)
     #[arg(long = "mc", requires = "is_udp", requires = "targets")]
@@ -2009,6 +2071,21 @@ impl NcArgs {
     fn is_using_channels(&self) -> bool {
         match self.forwarding_mode {
             ForwardingMode::Channels | ForwardingMode::LingerChannels => true,
+            _ => false,
+        }
+    }
+
+    fn is_interactive_input_mode(&self) -> bool {
+        // If the user is executing a child program, then the main stdin/stdout are not used, so it's definitely not
+        // interactive.
+        if self.exec_command_opt.is_some() {
+            return false;
+        }
+
+        // Only the main Stdin mode (in particular not StdinNoCharMode) counts as interactive, but only if there's a
+        // real terminal present. Something like file redirection wouldn't count.
+        match self.input_mode {
+            InputMode::Stdin => std::io::stdin().is_terminal(),
             _ => false,
         }
     }
