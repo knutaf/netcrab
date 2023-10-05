@@ -6,7 +6,10 @@ extern crate regex;
 
 use bytes::Bytes;
 use clap::{Args, CommandFactory, Parser, ValueEnum};
-use futures::{channel::mpsc, future, stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
+use futures::{
+    channel::mpsc, future, future::FusedFuture, stream::FuturesUnordered, FutureExt, SinkExt,
+    StreamExt,
+};
 use rand::{distributions::Distribution, Rng};
 use regex::Regex;
 use std::{
@@ -98,42 +101,42 @@ struct SourcedBytes {
 
 impl SourcedBytes {
     // Wrap bytes that were produced by the local machine with the special local route address that marks them as
-    // originating from the local machine. As a convenience, also wrap in a Result, which is what the various streams
-    // and sinks need.
-    fn ok_from_local(data: Bytes) -> std::io::Result<Self> {
-        Ok(Self {
+    // originating from the local machine.
+    fn create_with_local_source(data: Bytes) -> Self {
+        Self {
             data,
             route: LOCAL_IO_ROUTE_ADDR,
-        })
+        }
     }
 }
 
 type SockAddrSet = HashSet<SocketAddr>;
 type RouteAddrSet = HashSet<RouteAddr>;
 
-// A stream of bytes produced from the local machine. In contrast with bytes that come from the network, it has no
-// source address, though that is faked later in order to make it be treated just like other sockets by the router for
-// purposes of forwarding.
-//
-// Lifetime specifier is needed because in some places the local stream incorporates an object that references function
-// parameters (i.e. '_).
-type LocalIoStream<'a> = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + 'a>>;
+// A future that represents work that drives the local input to completion. It is used with any `InputMode`, regardless
+// of how input is obtained (stdin, random generation, etc.).
+type LocalInputDriver = Pin<Box<dyn FusedFuture<Output = std::io::Result<()>>>>;
 
 // A sink that accepts byte buffers and sends them to the local IO function (stdout, echo, null, etc.).
-type LocalIoSink = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error>>>;
+type LocalOutputSink = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error>>>;
 
 // When setting up local IO, it's common to set up both the way input enters the program and where output from the
 // program should go.
-type LocalIoSinkAndStream<'a> = (LocalIoSink, LocalIoStream<'a>);
+type LocalOutputSinkAndInputDriver = (LocalOutputSink, LocalInputDriver);
 
 // A sink that accepts Bytes to be sent to the network. When the router determines that data should be sent to a socket,
 // it sends it into this sink, where there is one per remote peer.
 type RouterToNetSink<'a> = Pin<Box<dyn futures::Sink<Bytes, Error = std::io::Error> + 'a>>;
 
-// A sink of bytes originating from some remote peer. Each socket drives data received on it to the router using this
-// sink, supplying where the data came from as well as the local address it arrives at. The router uses the data's
-// origin and local destination to decide where the data should be forwarded to.
-type NetToRouterSink = Pin<Box<dyn futures::Sink<SourcedBytes, Error = std::io::Error>>>;
+// A sink of bytes originating from some remote peer and sent to the router, which uses an mpsc::channel to collect
+// data from all sockets. Each socket drives data received on it to the router using this sink, supplying where the data
+// came from as well as the local address it arrives at. The router uses the data's origin and local destination to
+// decide where the data should be forwarded to. The type looks strange because the associated error has to be mapped to
+// `std::io::Error` to fit with what the rest of the program uses.
+type RouterSink = futures::sink::SinkMapErr<
+    mpsc::UnboundedSender<SourcedBytes>,
+    fn(mpsc::SendError) -> std::io::Error,
+>;
 
 // A grouping of connection information for a user-specified target, something passed as a command line arg. The
 // original argument value is stored as well as all the addresses that the name resolved to.
@@ -352,21 +355,18 @@ struct TcpRouter<'a> {
     // not to other channels.
     channels: ChannelMap,
 
-    // A sink where all sockets send data to the router for forwarding. Normally this would just be an UnboundedSender,
-    // but since we map the send error, it gets stored as a complicated type. Thanks, Rust.
-    net_collector_sink: futures::sink::SinkMapErr<
-        mpsc::UnboundedSender<SourcedBytes>,
-        fn(mpsc::SendError) -> std::io::Error,
-    >,
+    // A sink where all sockets send data to the router for forwarding. It is an mpsc::channel, so it gets cloned and
+    // handed out to each socket.
+    router_sink: RouterSink,
 
     // An internal stream that produces all of the data from all sockets that come into the router.
     inbound_net_traffic_stream: mpsc::UnboundedReceiver<SourcedBytes>,
 
-    // A stream of data produced from input to the program.
-    local_io_stream: LocalIoStream<'a>,
+    // A future that drives the local input to completion.
+    local_input_driver: LocalInputDriver,
 
     // A sink where the router can send data to be printed out.
-    local_io_sink: LocalIoSink,
+    local_output_sink: LocalOutputSink,
 
     // Used to figure out when to hook up the local input.
     lifetime_client_count: u32,
@@ -377,10 +377,10 @@ struct TcpRouter<'a> {
 
 impl<'a> TcpRouter<'a> {
     pub fn new(args: &'a NcArgs) -> TcpRouter<'a> {
-        let (net_collector_sink, inbound_net_traffic_stream) = mpsc::unbounded();
+        let (router_sink, inbound_net_traffic_stream) = mpsc::unbounded();
 
         // This funny syntax is required to coerce a function pointer to the fn type required by the field on the struct
-        let net_collector_sink = net_collector_sink.sink_map_err(
+        let router_sink = router_sink.sink_map_err(
             map_unbounded_sink_err_to_io_err as fn(mpsc::SendError) -> std::io::Error,
         );
 
@@ -388,10 +388,10 @@ impl<'a> TcpRouter<'a> {
             args,
             routes: HashMap::new(),
             channels: ChannelMap::new(),
-            net_collector_sink,
+            router_sink,
             inbound_net_traffic_stream,
-            local_io_stream: Box::pin(futures::stream::pending()),
-            local_io_sink: Box::pin(
+            local_input_driver: Box::pin(futures::future::pending()),
+            local_output_sink: Box::pin(
                 futures::sink::drain().sink_map_err(map_drain_sink_err_to_io_err),
             ),
             lifetime_client_count: 0,
@@ -402,7 +402,7 @@ impl<'a> TcpRouter<'a> {
     // Callers use this to add a new destination to the router for forwarding. The caller passes in the part of the TCP
     // socket that the router can use to write data to the socket, and it returns a sink where the caller can write data
     // to the router.
-    pub fn add_route(&mut self, tx_socket: tokio::net::tcp::OwnedWriteHalf) -> NetToRouterSink {
+    pub fn add_route(&mut self, tx_socket: tokio::net::tcp::OwnedWriteHalf) -> RouterSink {
         let new_route = RouteAddr {
             local: tx_socket.local_addr().unwrap(),
             peer: tx_socket.peer_addr().unwrap(),
@@ -422,12 +422,13 @@ impl<'a> TcpRouter<'a> {
         // out of, say, a redirected input stream, and forward it to nobody, because there are no other clients.
         self.lifetime_client_count += 1;
         if self.lifetime_client_count == 1 {
-            (self.local_io_sink, self.local_io_stream) = setup_local_io(self.args);
+            (self.local_output_sink, self.local_input_driver) =
+                setup_local_io(self.args, self.router_sink.clone());
         }
 
-        // The input end of the router (`net_collector_sink`) can be cloned to allow multiple callers to pass data into
-        // the same channel.
-        Box::pin(self.net_collector_sink.clone())
+        // The input end of the router (`router_sink`) can be cloned to allow multiple callers to pass data into the
+        // same channel.
+        self.router_sink.clone()
     }
 
     pub fn remove_route(&mut self, route: &RouteAddr) {
@@ -444,11 +445,9 @@ impl<'a> TcpRouter<'a> {
     ) {
         let removed = routes.remove(route);
 
-        // In channels mode we might have torn down an extra route here, which would cause cleanup_route to be called
-        // to notify us that the route had closed, but that's because we already did it. Permit it to happen in this
-        // mode.
+        // It's possible this route has already been cleaned up because the router noticed when forwarding to it that it
+        // was closed.
         if removed.is_none() {
-            assert!(args.forwarding_mode == ForwardingMode::Channels);
             return;
         }
 
@@ -473,17 +472,8 @@ impl<'a> TcpRouter<'a> {
 
     // Start asynchronously processing data from all managed sockets.
     pub async fn service(&mut self) -> std::io::Result<()> {
-        // Since there is only one local input and output (i.e. stdin/stdout), don't create a new channel to add it to
-        // the router. Instead just feed data into the router directly by tagging it as originating from the local
-        // input.
-        let mut local_io_to_router_sink = Box::pin(
-            self.net_collector_sink
-                .clone()
-                .with(|b| async { SourcedBytes::ok_from_local(b) }),
-        );
-
         // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
-        let mut local_io_sink_opt = Some(&mut self.local_io_sink);
+        let mut local_output_sink_opt = Some(&mut self.local_output_sink);
 
         let mut stats_tracker = StatsTracker::new();
 
@@ -580,12 +570,12 @@ impl<'a> TcpRouter<'a> {
                     // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
                     if sb.route.peer != LOCAL_IO_PEER_ADDR {
                         stats_tracker.record_recv(&sb.data);
-                        if let Some(ref mut local_io_sink) = local_io_sink_opt {
+                        if let Some(ref mut local_output_sink) = local_output_sink_opt {
                             // If we hit an error emitting output, clear out the local output sink so we don't bother
                             // trying to output more.
-                            if let Err(e) = local_io_sink.send(sb.data.clone()).await {
+                            if let Err(e) = local_output_sink.send(sb.data.clone()).await {
                                 eprintln!("Local output closed. {}", e);
-                                local_io_sink_opt = None;
+                                local_output_sink_opt = None;
                             }
                         }
                     }
@@ -610,13 +600,14 @@ impl<'a> TcpRouter<'a> {
                     }
                 },
 
-                // Send in all data from the local input to the router.
-                _result = local_io_to_router_sink.send_all(&mut self.local_io_stream).fuse() => {
+                // Drive local input to the router until it completes. `local_input_driver` was previously already
+                // passed the `router_sink` so it knows to send it to the router.
+                _result = &mut self.local_input_driver => {
                     eprintln!("End of outbound data from local machine reached.");
 
                     // Send an empty message as a special signal that the local stream has finished.
-                    local_io_to_router_sink.send(Bytes::new()).await.expect("Local IO sink should not be closed early!");
-                    self.local_io_stream = Box::pin(futures::stream::pending());
+                    self.router_sink.send(SourcedBytes::create_with_local_source(Bytes::new())).await.expect("Router sink should not be closed early!");
+                    self.local_input_driver = Box::pin(futures::future::pending());
                 },
             }
         }
@@ -646,18 +637,26 @@ fn map_drain_sink_err_to_io_err(_err: std::convert::Infallible) -> std::io::Erro
 // For iterators, we shouldn't yield items as quickly as possible, or else the runtime sometimes doesn't give enough
 // processing time to other tasks. This creates a stream out of an iterator but also makes sure to yield after every
 // element to make sure it can flow through the rest of the system.
-fn local_io_stream_from_iter<'a, TIter>(iter: TIter) -> LocalIoStream<'a>
+fn local_input_driver_from_iter<TIter>(iter: TIter, mut router_sink: RouterSink) -> LocalInputDriver
 where
-    TIter: Iterator<Item = std::io::Result<Bytes>> + 'a,
+    TIter: Iterator<Item = std::io::Result<Bytes>> + 'static,
 {
-    Box::pin(futures::stream::iter(iter).then(|e| async move {
-        tokio::task::yield_now().await;
-        e
-    }))
+    // Async block moves in the iterator and router sink.
+    Box::pin(
+        async move {
+            let mut stream = Box::pin(futures::stream::iter(iter).then(|e| async {
+                tokio::task::yield_now().await;
+                e.map(SourcedBytes::create_with_local_source)
+            }));
+
+            router_sink.send_all(&mut stream).await
+        }
+        .fuse(),
+    )
 }
 
 // Setup an output sink that either goes to stdout or to the void, depending on the user's selection.
-fn setup_local_output(args: &NcArgs) -> LocalIoSink {
+fn setup_local_output(args: &NcArgs) -> LocalOutputSink {
     let codec = BytesCodec::new();
     match args.output_mode {
         OutputMode::Stdout => Box::pin(FramedWrite::new(tokio::io::stdout(), codec)),
@@ -676,23 +675,20 @@ fn setup_local_output(args: &NcArgs) -> LocalIoSink {
 // process stdout.
 fn setup_async_reader_thread<TInput>(
     mut input_reader: TInput,
+    mut router_sink: RouterSink,
     args: &NcArgs,
-) -> mpsc::UnboundedReceiver<std::io::Result<Bytes>>
+) -> LocalInputDriver
 where
     TInput: std::io::Read + std::marker::Send + 'static,
 {
-    // Unbounded is OK because we'd rather prioritize faster throughput at the cost of more memory.
-    let (mut tx_input, rx_input) = mpsc::unbounded();
-
     // If the user is interactively using the program, by default use "character mode", which inputs a character on
     // every keystroke rather than a full line when hitting enter. However, the user can request to use normal stdin
     // mode, and if this is reading from a child program execution, that definitely can't use character mode.
     let is_interactive_mode = args.is_interactive_input_mode();
     let chunk_size = args.send_size;
 
-    let _thread = std::thread::Builder::new()
-        .name("stdin_reader".to_string())
-        .spawn(move || {
+    Box::pin(
+        tokio::task::spawn(async move {
             // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size
             // It will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed
             // for the next chunk.
@@ -701,7 +697,7 @@ where
             // The available buffer (pointer to next byte to write and remaining available space in the chunk).
             let mut available_buf = &mut read_buf[..];
 
-            if is_interactive_mode {
+            let result = if is_interactive_mode {
                 // The console crate has a function called stdout that gives you, uh, a Term object that also services
                 // input. OK dude.
                 let mut stdio = console::Term::stdout();
@@ -710,55 +706,61 @@ where
                 let mut char_buf = [0u8; std::mem::size_of::<char>()];
                 let char_buf_len = char_buf.len();
 
-                while let Ok(ch) = stdio.read_char() {
-                    // Encode the char from input as a series of bytes.
-                    let encoded_str = ch.encode_utf8(&mut char_buf);
-                    let num_bytes_read = encoded_str.len();
-                    assert!(num_bytes_read <= char_buf_len);
+                'outer: loop {
+                    let read_result = stdio.read_char();
+                    if let Ok(ch) = read_result {
+                        // Encode the char from input as a series of bytes.
+                        let encoded_str = ch.encode_utf8(&mut char_buf);
+                        let num_bytes_read = encoded_str.len();
+                        assert!(num_bytes_read <= char_buf_len);
 
-                    // Echo the char back out, because `read_char` doesn't.
-                    let _ = stdio.write(encoded_str.as_bytes());
+                        // Echo the char back out, because `read_char` doesn't.
+                        let _ = stdio.write(encoded_str.as_bytes());
 
-                    // Track a slice of the remaining bytes of the just-read char that haven't been sent yet.
-                    let mut char_bytes_remaining = &mut char_buf[..num_bytes_read];
-                    while char_bytes_remaining.len() > 0 {
-                        // There might not be enough space left in the chunk to fit the whole char.
-                        let num_bytes_copyable =
-                            std::cmp::min(available_buf.len(), char_bytes_remaining.len());
-                        assert!(num_bytes_copyable <= available_buf.len());
-                        assert!(num_bytes_copyable <= char_bytes_remaining.len());
-                        assert!(num_bytes_copyable > 0);
+                        // Track a slice of the remaining bytes of the just-read char that haven't been sent yet.
+                        let mut char_bytes_remaining = &mut char_buf[..num_bytes_read];
+                        while char_bytes_remaining.len() > 0 {
+                            // There might not be enough space left in the chunk to fit the whole char.
+                            let num_bytes_copyable =
+                                std::cmp::min(available_buf.len(), char_bytes_remaining.len());
+                            assert!(num_bytes_copyable <= available_buf.len());
+                            assert!(num_bytes_copyable <= char_bytes_remaining.len());
+                            assert!(num_bytes_copyable > 0);
 
-                        // Copy as much of the char as possible into the chunk. Note that for UTF-8 characters sent in
-                        // UDP datagrams, if we fail to copy the whole character into a given datagram, the resultant
-                        // traffic might be... strange. Imagine having a UTF-8 character split across two datagrams.
-                        // Not great, but also not lossy, so who is to say what is correct? It's not possible to fully
-                        // fill every UDP datagram of arbitrary size with varying size UTF-8 characters and not
-                        // sometimes slice them.
-                        available_buf[..num_bytes_copyable]
-                            .copy_from_slice(&char_bytes_remaining[..num_bytes_copyable]);
+                            // Copy as much of the char as possible into the chunk. Note that for UTF-8 characters sent
+                            // in UDP datagrams, if we fail to copy the whole character into a given datagram, the
+                            // resultant traffic might be... strange. Imagine having a UTF-8 character split across two
+                            // datagrams. Not great, but also not lossy, so who is to say what is correct? It's not
+                            // possible to fully fill every UDP datagram of arbitrary size with varying size UTF-8
+                            // characters and not sometimes slice them.
+                            available_buf[..num_bytes_copyable]
+                                .copy_from_slice(&char_bytes_remaining[..num_bytes_copyable]);
 
-                        // Update the available buffer to the remaining space in the chunk after copying in this char.
-                        available_buf = &mut available_buf[num_bytes_copyable..];
+                            // Update the available buffer to the remaining space in the chunk after copying in this
+                            // char.
+                            available_buf = &mut available_buf[num_bytes_copyable..];
 
-                        // Advance the remaining slice of the char to the uncopied portion.
-                        char_bytes_remaining = &mut char_bytes_remaining[num_bytes_copyable..];
+                            // Advance the remaining slice of the char to the uncopied portion.
+                            char_bytes_remaining = &mut char_bytes_remaining[num_bytes_copyable..];
 
-                        // There's no more available buffer in this chunk, meaning we've accumulated a full chunk, so
-                        // send it now.
-                        if available_buf.len() == 0 {
-                            // Stop borrowing read_buf for a hot second so it can be sent.
-                            available_buf = &mut [];
+                            // There's no more available buffer in this chunk, meaning we've accumulated a full chunk,
+                            // so send it now.
+                            if available_buf.len() == 0 {
+                                let send_result = router_sink
+                                    .send(SourcedBytes::create_with_local_source(
+                                        Bytes::copy_from_slice(&read_buf),
+                                    ))
+                                    .await;
+                                if send_result.is_err() {
+                                    break 'outer send_result;
+                                }
 
-                            if let Err(_) =
-                                tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
-                            {
-                                break;
+                                // The chunk was sent. Reset the available buffer to allow storing the next chunk.
+                                available_buf = &mut read_buf[..];
                             }
-
-                            // The chunk was sent. Reset the available buffer to allow storing the next chunk.
-                            available_buf = &mut read_buf[..];
                         }
+                    } else {
+                        break read_result.map(|_| ());
                     }
                 }
             } else {
@@ -766,39 +768,46 @@ where
                     if let Ok(num_bytes_read) = input_reader.read(available_buf) {
                         if num_bytes_read == 0 {
                             // EOF. Disconnect from the channel too.
-                            tx_input.disconnect();
-                            break;
+                            if let Err(e) = router_sink.close().await {
+                                eprintln!("Failed to close router sink. Error {}", e);
+                            }
+
+                            break Ok(());
                         }
 
                         assert!(num_bytes_read <= available_buf.len());
 
                         // We've accumulated a full chunk, so send it now.
                         if num_bytes_read == available_buf.len() {
-                            if let Err(_) =
-                                tx_input.unbounded_send(Ok(Bytes::copy_from_slice(&read_buf)))
-                            {
-                                eprintln!("breaking 1");
-                                break;
+                            let send_result = router_sink
+                                .send(SourcedBytes::create_with_local_source(
+                                    Bytes::copy_from_slice(&read_buf),
+                                ))
+                                .await;
+                            if send_result.is_err() {
+                                break send_result;
                             }
 
                             // The chunk was sent. Reset the buffer to allow storing the next chunk.
                             available_buf = &mut read_buf[..];
                         } else {
-                            // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past the
-                            // portion that was written to.
+                            // Read buffer isn't full yet. Set the available buffer to the rest of the buffer just past
+                            // the portion that was written to.
                             available_buf = &mut available_buf[num_bytes_read..];
                         }
                     }
                 }
-            }
-        })
-        .expect("Failed to create input reader thread");
+            };
 
-    rx_input
+            result
+        })
+        .map(|res| res.unwrap())
+        .fuse(),
+    )
 }
 
 // Return a sink and create a thread that writes everything from that sink to the specified writer.
-fn setup_async_writer_thread<TOutput>(mut output_sink: TOutput) -> LocalIoSink
+fn setup_async_writer_thread<TOutput>(mut output_writer: TOutput) -> LocalOutputSink
 where
     TOutput: std::io::Write + std::marker::Send + 'static,
 {
@@ -813,7 +822,7 @@ where
                 loop {
                     match stream.next().await {
                         Some(bytes) => {
-                            output_sink.write_all(&bytes)?;
+                            output_writer.write_all(&bytes)?;
                         }
                         None => {
                             eprintln!("Output closed.");
@@ -910,7 +919,7 @@ impl Iterator for FixedBytesIter {
     }
 }
 
-fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
+fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndInputDriver {
     if let Some(command) = args.exec_command_opt.as_ref() {
         // Pipe stdin and stdout from the child process here so it can be wired up to the network.
         let mut prog = execute::shell(command)
@@ -922,30 +931,33 @@ fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
 
         return (
             Box::pin(setup_async_writer_thread(prog.stdin.take().unwrap())),
-            Box::pin(setup_async_reader_thread(prog.stdout.take().unwrap(), args)),
+            Box::pin(setup_async_reader_thread(
+                prog.stdout.take().unwrap(),
+                router_sink,
+                args,
+            )),
         );
     }
 
     match args.input_mode {
-        InputMode::Null => (
+        // Echo mode doesn't have a stream that produces data for sending. That will come directly from the sockets that
+        // send data to this machine. It's handled in the routing code.
+        InputMode::Null | InputMode::Echo => (
             setup_local_output(args),
-            Box::pin(futures::stream::pending()),
+            Box::pin(futures::future::pending()),
         ),
         InputMode::Stdin | InputMode::StdinNoCharMode => (
             setup_local_output(args),
             // Set up a thread to read from stdin. It will produce only chunks of the required size to send.
-            Box::pin(setup_async_reader_thread(std::io::stdin(), args)),
-        ),
-
-        // Echo mode doesn't have a stream that produces data for sending. That will come directly from the sockets that
-        // send data to this machine. It's handled in the routing code.
-        InputMode::Echo => (
-            setup_local_output(args),
-            Box::pin(futures::stream::pending()),
+            Box::pin(setup_async_reader_thread(
+                std::io::stdin(),
+                router_sink,
+                args,
+            )),
         ),
         InputMode::Random => (
             setup_local_output(args),
-            local_io_stream_from_iter(RandBytesIter::new(&args.rand_config)),
+            local_input_driver_from_iter(RandBytesIter::new(&args.rand_config), router_sink),
         ),
         InputMode::Fixed => (setup_local_output(args), {
             // Create a random buffer of the size requested by send_size and containing data that matches the
@@ -959,8 +971,8 @@ fn setup_local_io(args: &NcArgs) -> LocalIoSinkAndStream {
             let fixed_buf = RandBytesIter::new(&conf).next().unwrap().unwrap();
             assert!(fixed_buf.len() == args.send_size as usize);
 
-            // Return a stream that will just keep producing that same fixed buffer forever.
-            local_io_stream_from_iter(FixedBytesIter::new(fixed_buf))
+            // This will just keep sending that same fixed buffer to the router forever.
+            local_input_driver_from_iter(FixedBytesIter::new(fixed_buf), router_sink)
         }),
     }
 }
@@ -1259,6 +1271,7 @@ async fn do_tcp(
         }
     }
 
+    let mut last_result = Ok(());
     loop {
         // If we ever aren't at maximum clients accepted, start listening on all the specified addresses in order to
         // accept new clients. Only do this if we aren't currently listening.
@@ -1361,6 +1374,8 @@ async fn do_tcp(
                         }
                     };
 
+                last_result = result;
+
                 // Every time a socket closes, it's possible it was because the router finished, so check to
                 // make sure the router is still active before doing things like reconnecting.
                 if !router.is_done {
@@ -1403,7 +1418,7 @@ async fn do_tcp(
             && listeners.is_empty()
             && accepts.is_empty()
         {
-            return Ok(());
+            return last_result;
         }
     }
 }
@@ -1411,7 +1426,7 @@ async fn do_tcp(
 async fn handle_tcp_stream(
     rx_socket: tokio::net::tcp::OwnedReadHalf,
     args: &NcArgs,
-    mut net_to_router_sink: NetToRouterSink,
+    mut net_to_router_sink: RouterSink,
 ) -> (std::io::Result<()>, RouteAddr) {
     let route_addr = RouteAddr::from_tcp_stream(&rx_socket);
 
@@ -1595,22 +1610,14 @@ async fn handle_udp_sockets(
     }
 
     let (router_sink, mut inbound_net_traffic_stream) = mpsc::unbounded();
-    let router_sink = router_sink.sink_map_err(map_unbounded_sink_err_to_io_err);
+    let mut router_sink = router_sink
+        .sink_map_err(map_unbounded_sink_err_to_io_err as fn(mpsc::SendError) -> std::io::Error);
 
     // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
-    let mut local_io_sink_opt = None;
+    let mut local_output_sink_opt = None;
 
     // Until the first peer is known, don't start pulling from local input, or else it will get consumed too early.
-    let mut local_io_stream: LocalIoStream = Box::pin(futures::stream::pending());
-
-    // Since there is only one local input and output (i.e. stdin/stdout), don't create a new channel to add it to
-    // the router. Instead just feed data into the router directly by tagging it as originating from the local
-    // input.
-    let mut local_io_to_router_sink = Box::pin(
-        router_sink
-            .clone()
-            .with(|b| async { SourcedBytes::ok_from_local(b) }),
-    );
+    let mut local_input_driver: LocalInputDriver = Box::pin(futures::future::pending());
 
     // A collection of all inbound traffic going to the router.
     let mut net_to_router_flows = FuturesUnordered::new();
@@ -1678,11 +1685,12 @@ async fn handle_udp_sockets(
 
         if lifetime_client_count == 1 {
             // Since we have a remote peer hooked up, start processing local IO.
-            let (local_io_sink, local_io_stream2) = setup_local_io(args);
-            local_io_stream = local_io_stream2;
+            let (local_output_sink, local_input_driver2) =
+                setup_local_io(args, router_sink.clone());
+            local_input_driver = local_input_driver2;
 
-            assert!(local_io_sink_opt.is_none());
-            local_io_sink_opt = Some(local_io_sink);
+            assert!(local_output_sink_opt.is_none());
+            local_output_sink_opt = Some(local_output_sink);
         }
     }
 
@@ -1731,10 +1739,10 @@ async fn handle_udp_sockets(
                     // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
                     // the data out of, say, a redirected input stream, and forward it to nobody, because there are no
                     // other clients.
-                    if lifetime_client_count == 1 && local_io_sink_opt.is_none() {
-                        let (local_io_sink, local_io_stream2) = setup_local_io(args);
-                        local_io_stream = local_io_stream2;
-                        local_io_sink_opt = Some(local_io_sink);
+                    if lifetime_client_count == 1 && local_output_sink_opt.is_none() {
+                        let (local_output_sink, local_input_driver2) = setup_local_io(args, router_sink.clone());
+                        local_input_driver = local_input_driver2;
+                        local_output_sink_opt = Some(local_output_sink);
                     }
                 }
 
@@ -1797,12 +1805,12 @@ async fn handle_udp_sockets(
                 // Came from a remote endpoint, so also send to local IO.
                 if sb.route.peer != LOCAL_IO_PEER_ADDR {
                     stats_tracker.record_recv(&sb.data);
-                    if let Some(ref mut local_io_sink) = local_io_sink_opt {
+                    if let Some(ref mut local_output_sink) = local_output_sink_opt {
                         // If we hit an error emitting output, clear out the local output sink so we don't bother
                         // trying to output more.
-                        if let Err(e) = local_io_sink.send(sb.data.clone()).await {
+                        if let Err(e) = local_output_sink.send(sb.data.clone()).await {
                             eprintln!("Local output closed. {}", e);
-                            local_io_sink_opt = None;
+                            local_output_sink_opt = None;
                         }
                     }
                 }
@@ -1830,11 +1838,12 @@ async fn handle_udp_sockets(
                     }
                 }
             },
-            _result = local_io_to_router_sink.send_all(&mut local_io_stream).fuse() => {
+            _result = &mut local_input_driver => {
                 eprintln!("End of outbound data from local machine reached.");
-                local_io_stream = Box::pin(futures::stream::pending());
+                local_input_driver = Box::pin(futures::future::pending());
+
                 // Send an empty message as a special signal that the local stream has finished.
-                local_io_to_router_sink.send(Bytes::new()).await.expect("Local IO sink should not be closed early!");
+                router_sink.send(SourcedBytes::create_with_local_source(Bytes::new())).await.expect("Local IO sink should not be closed early!");
             },
         }
     }
@@ -2098,8 +2107,7 @@ fn usage(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+async fn async_main() -> Result<(), String> {
     let mut args = NcArgs::parse();
 
     if args.help_more {
@@ -2135,8 +2143,8 @@ async fn main() -> Result<(), String> {
 
             // Check and see if the user appended x123 or whatever as a multiplier at the end of the target string.
             if let Some(captures) = TARGET_MULTIPLIER_REGEX.captures_iter(&target).next() {
-                // Capture 0 is the entire matched text, so the part from the start up to the first captured
-                // character is the "before" portion.
+                // Capture 0 is the entire matched text, so the part from the start up to the first captured character
+                // is the "before" portion.
                 let before_match = &target[..captures.get(0).unwrap().start()];
 
                 // Get the first capture, which should be the multiplier string.
@@ -2175,9 +2183,9 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    // Option::iter() makes an iterator that yields either 0 or 1 item, depending on if it's None or Some.
-    // The `true` param for get_local_addrs tells it to automatically include the wildcard local address if no source
-    // addresses were explicitly specified.
+    // Option::iter() makes an iterator that yields either 0 or 1 item, depending on if it's None or Some. The `true`
+    // param for get_local_addrs tells it to automatically include the wildcard local address if no source addresses
+    // were explicitly specified.
     let outbound_source_addrs = get_local_addrs(
         args.outbound_source_host_opt
             .iter()
@@ -2204,8 +2212,8 @@ async fn main() -> Result<(), String> {
             .await
             .map_err(format_io_err)?;
 
-    // If max_inbound_connections wasn't specified explicitly, set its value automatically. If in hub or channel
-    // mode, you generally want more than one incoming client at a time, or else why are you in a forwarding mode??
+    // If max_inbound_connections wasn't specified explicitly, set its value automatically. If in hub or channel mode,
+    // you generally want more than one incoming client at a time, or else why are you in a forwarding mode??
     // Otherwise, safely limit to just one per user-specified listen address at a time.
     if args.max_inbound_connections.is_none() {
         args.max_inbound_connections = Some(
@@ -2226,4 +2234,20 @@ async fn main() -> Result<(), String> {
     };
 
     result.map_err(format_io_err)
+}
+
+fn main() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = runtime.block_on(async_main());
+
+    // At this point there may be a task blocked on reading from stdin or a child process's stdout. It won't return
+    // until the next read completes, but we don't want to wait for that. Given that we've already decided not to do
+    // anything further (the main task above is done), just shut down those lingering tasks so the program can exit.
+    runtime.shutdown_background();
+
+    result
 }
