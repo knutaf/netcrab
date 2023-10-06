@@ -4,7 +4,7 @@
 extern crate execute;
 extern crate regex;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use clap::{Args, CommandFactory, Parser, ValueEnum};
 use futures::{
     channel::mpsc, future, future::FusedFuture, stream::FuturesUnordered, FutureExt, SinkExt,
@@ -681,18 +681,57 @@ fn setup_async_reader_thread<TInput>(
 where
     TInput: std::io::Read + std::marker::Send + 'static,
 {
+    // Helper function to send the current buffer and reset it so it can be used for the next chunk.
+    async fn send_and_reset_buffer(
+        read_buf: &mut BytesMut,
+        router_sink: &mut RouterSink,
+        chunk_size: usize,
+        alloc_size: usize,
+    ) -> std::io::Result<()> {
+        router_sink
+            .send(SourcedBytes::create_with_local_source(
+                read_buf.split().freeze(),
+            ))
+            .await?;
+
+        // After `split`, the original buffer is empty, so it needs to be reallocated and have its length set again so
+        // it can be used for the next chunk.
+        //
+        // SAFETY: We'll only access the portion of the buffer that was written to.
+        assert!(read_buf.capacity() % chunk_size == 0);
+        if read_buf.capacity() == 0 {
+            // Allocate a fresh buffer instead of calling `reserve`. While it's true that `reserve` can do fancy things
+            // like reuse the allocated buffer if there are no further handles to it, in practice parallelism prevents
+            // the optimal condition from occurring, and instead memory usage just balloons as this keeps adding to the
+            // inner buffer.
+            *read_buf = BytesMut::with_capacity(alloc_size);
+        }
+
+        assert!(read_buf.capacity() >= chunk_size);
+        unsafe { read_buf.set_len(chunk_size) };
+
+        Ok(())
+    }
+
     // If the user is interactively using the program, by default use "character mode", which inputs a character on
     // every keystroke rather than a full line when hitting enter. However, the user can request to use normal stdin
     // mode, and if this is reading from a child program execution, that definitely can't use character mode.
     let is_interactive_mode = args.is_interactive_input_mode();
-    let chunk_size = args.send_size;
+    let chunk_size = args.send_size as usize;
 
     Box::pin(
         tokio::task::spawn(async move {
             // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size
             // It will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed
             // for the next chunk.
-            let mut read_buf = vec![0u8; chunk_size as usize];
+            //
+            // I attempted some experiments with reserving more space up front to reduce the frequency of allocations
+            // but was unable to measure a difference, so we'll stick with less memory consumption.
+            //
+            // SAFETY: Only the portion that's written to is accessed. The uninitialized portion is not accessed.
+            let alloc_size = chunk_size * 1;
+            let mut read_buf = BytesMut::with_capacity(alloc_size);
+            unsafe { read_buf.set_len(chunk_size) };
 
             // The available buffer (pointer to next byte to write and remaining available space in the chunk).
             let mut available_buf = &mut read_buf[..];
@@ -746,11 +785,13 @@ where
                             // There's no more available buffer in this chunk, meaning we've accumulated a full chunk,
                             // so send it now.
                             if available_buf.len() == 0 {
-                                let send_result = router_sink
-                                    .send(SourcedBytes::create_with_local_source(
-                                        Bytes::copy_from_slice(&read_buf),
-                                    ))
-                                    .await;
+                                let send_result = send_and_reset_buffer(
+                                    &mut read_buf,
+                                    &mut router_sink,
+                                    chunk_size,
+                                    alloc_size,
+                                )
+                                .await;
                                 if send_result.is_err() {
                                     break 'outer send_result;
                                 }
@@ -779,11 +820,13 @@ where
 
                         // We've accumulated a full chunk, so send it now.
                         if num_bytes_read == available_buf.len() {
-                            let send_result = router_sink
-                                .send(SourcedBytes::create_with_local_source(
-                                    Bytes::copy_from_slice(&read_buf),
-                                ))
-                                .await;
+                            let send_result = send_and_reset_buffer(
+                                &mut read_buf,
+                                &mut router_sink,
+                                chunk_size,
+                                alloc_size,
+                            )
+                            .await;
                             if send_result.is_err() {
                                 break send_result;
                             }
@@ -843,9 +886,6 @@ struct RandBytesIter {
     config: RandConfig,
     rand_iter: Box<dyn Iterator<Item = u8>>,
     rng: rand::rngs::ThreadRng,
-
-    // Temporary storage for filling the next chunk before it's emitted from next(). Stored here to reduce allocations.
-    chunk_storage: Vec<u8>,
 }
 
 impl RandBytesIter {
@@ -872,7 +912,6 @@ impl RandBytesIter {
             config: config.clone(),
             rand_iter,
             rng: rand::thread_rng(),
-            chunk_storage: vec![0u8; config.size_max],
         }
     }
 }
@@ -886,16 +925,19 @@ impl Iterator for RandBytesIter {
             .rng
             .gen_range(self.config.size_min..=self.config.size_max);
 
-        // Fill that amount of the temporary storage with random data.
+        let mut chunk_storage = BytesMut::with_capacity(next_size);
+
+        // I was able to measure it much faster to set the length once up front and index into the buffer to write it
+        // compared to calling put_u8 repeatedly.
+        //
+        // SAFETY: `set_len` leaves an uninitialized buffer. Here we're definitely filling in the entire space with
+        // random data.
+        unsafe { chunk_storage.set_len(next_size) };
         for i in 0..next_size {
-            self.chunk_storage[i] = self.rand_iter.next().unwrap();
+            chunk_storage[i] = self.rand_iter.next().unwrap();
         }
 
-        // Generate a Bytes that contains that portion of the data. For now this is an allocation.
-        // TODO: can we get rid of this allocation?
-        Some(Ok(Bytes::copy_from_slice(
-            &self.chunk_storage[0..next_size],
-        )))
+        Some(Ok(chunk_storage.freeze()))
     }
 }
 
