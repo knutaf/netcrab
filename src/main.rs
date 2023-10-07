@@ -641,7 +641,7 @@ fn local_input_driver_from_iter<TIter>(iter: TIter, mut router_sink: RouterSink)
 where
     TIter: Iterator<Item = std::io::Result<Bytes>> + 'static,
 {
-    // Async block moves in the iterator and router sink.
+    // Transfer ownership of the iterator and router sink into the async block.
     Box::pin(
         async move {
             let mut stream = Box::pin(futures::stream::iter(iter).then(|e| async {
@@ -849,37 +849,6 @@ where
     )
 }
 
-// Return a sink and create a thread that writes everything from that sink to the specified writer.
-fn setup_async_writer_thread<TOutput>(mut output_writer: TOutput) -> LocalOutputSink
-where
-    TOutput: std::io::Write + std::marker::Send + 'static,
-{
-    let (sink, mut stream) = mpsc::unbounded::<Bytes>();
-    let sink = sink.sink_map_err(map_unbounded_sink_err_to_io_err);
-    let sink_ret = sink.clone();
-
-    std::thread::Builder::new()
-        .name("output_writer".to_string())
-        .spawn(move || {
-            futures::executor::block_on(async {
-                loop {
-                    match stream.next().await {
-                        Some(bytes) => {
-                            output_writer.write_all(&bytes)?;
-                        }
-                        None => {
-                            eprintln!("Output closed.");
-                            return std::io::Result::Ok(());
-                        }
-                    }
-                }
-            })
-        })
-        .expect("Failed to create writer thread");
-
-    Box::pin(sink_ret)
-}
-
 // An iterator that generates random u8 values according to the given distribution. Actually wraps that in a
 // Result<Bytes> to fit the way it is used to produce a stream of Bytes.
 struct RandBytesIter {
@@ -972,7 +941,10 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             .expect("Failed to execute command");
 
         return (
-            Box::pin(setup_async_writer_thread(prog.stdin.take().unwrap())),
+            Box::pin(FramedWrite::new(
+                tokio::process::ChildStdin::from_std(prog.stdin.take().unwrap()).unwrap(),
+                BytesCodec::new(),
+            )),
             Box::pin(setup_async_reader_thread(
                 prog.stdout.take().unwrap(),
                 router_sink,
