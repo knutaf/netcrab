@@ -1,3 +1,4 @@
+// TODO knutaf fmt
 // For AsFd/AsSocket shenanigans.
 #![feature(trait_alias)]
 
@@ -50,18 +51,21 @@ struct RouteAddr {
     peer: SocketAddr,
 }
 
-impl RouteAddr {
-    fn from_tcp_stream(rx_socket: &tokio::net::tcp::OwnedReadHalf) -> Self {
-        Self {
-            local: rx_socket.local_addr().unwrap(),
-            peer: rx_socket.peer_addr().unwrap(),
-        }
-    }
-}
-
 impl std::fmt::Display for RouteAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}<->{}", &self.local, &self.peer)
+    }
+}
+
+// A `RouteId` is just a smaller identifier to replace the massive `RouteAddr` (64 bytes!) when attaching to a data
+// packet flowing from the network to the router. A `Routedb` object is used to maintain a mapping between
+// `RouteAddr` <--> `RouteId`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct RouteId(u16);
+
+impl std::fmt::Display for RouteId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -75,28 +79,19 @@ const DEFAULT_INPUT_MODE: InputMode = if cfg!(unix) {
     InputMode::Stdin
 };
 
-// Bytes sourced from the local machine are marked with a special peer address so they can be treated similarly to
-// sockets even when it's not a real socket (and therefore doesn't have a real network address.
-const LOCAL_IO_PEER_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
-    std::net::Ipv4Addr::UNSPECIFIED,
-    0,
-));
-
-// A special route used by bytes sourced from the local machine.
-const LOCAL_IO_ROUTE_ADDR: RouteAddr = RouteAddr {
-    local: LOCAL_IO_PEER_ADDR,
-    peer: LOCAL_IO_PEER_ADDR,
-};
+// Bytes sourced from the local machine are marked with a route id so they can be treated similarly to
+// sockets even when it's not a real socket (and therefore doesn't have a real network address).
+const LOCAL_IO_ROUTE_ID: RouteId = RouteId(0);
 
 // Emit stats every 1 sec.
 const STATS_OUTPUT_PERIOD: std::time::Duration = std::time::Duration::new(1, 0);
 
-// A buffer of bytes that carries both the remote peer that sent it to this machine and the local address it was
-// destined for. Used for figuring out which remote machines it should be forwarded to.
+// A buffer of bytes that carries a route id, which represents both the remote peer that sent it to this machine and the
+// local address it was destined for. Used for figuring out which remote machines it should be forwarded to.
 #[derive(Debug)]
 struct SourcedBytes {
     data: Bytes,
-    route: RouteAddr,
+    route_id: RouteId,
 }
 
 impl SourcedBytes {
@@ -105,13 +100,14 @@ impl SourcedBytes {
     fn create_with_local_source(data: Bytes) -> Self {
         Self {
             data,
-            route: LOCAL_IO_ROUTE_ADDR,
+            route_id: LOCAL_IO_ROUTE_ID,
         }
     }
 }
 
 type SockAddrSet = HashSet<SocketAddr>;
 type RouteAddrSet = HashSet<RouteAddr>;
+type RouteIdSet = HashSet<RouteId>;
 
 // A future that represents work that drives the local input to completion. It is used with any `InputMode`, regardless
 // of how input is obtained (stdin, random generation, etc.).
@@ -234,7 +230,7 @@ lazy_static! {
 }
 
 // Core logic used by the router to decide where to forward messages, generally used when not in channel mode.
-fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> bool {
+fn should_forward_to(args: &NcArgs, source: RouteId, dest: RouteId) -> bool {
     // In echo mode, allow sending data back to the source.
     if source == dest && args.input_mode != InputMode::Echo {
         if args.verbose {
@@ -249,8 +245,8 @@ fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> b
     // echo mode).
     if args.forwarding_mode != ForwardingMode::Hub
         && (dest != source)
-        && *dest != LOCAL_IO_PEER_ADDR
-        && *source != LOCAL_IO_PEER_ADDR
+        && dest != LOCAL_IO_ROUTE_ID
+        && source != LOCAL_IO_ROUTE_ID
     {
         if args.verbose {
             eprintln!("Skipping forwarding to other remote endpoint due to not hub mode.");
@@ -262,12 +258,93 @@ fn should_forward_to(args: &NcArgs, source: &SocketAddr, dest: &SocketAddr) -> b
     true
 }
 
+// A database that maps route addresses (64 bytes long!) to a much smaller `RouteId` (only a few bytes). The id ends up
+// just being the index in the internal array where the `RouteAddr` is stored, offset by a bit to account for specially
+// reserved route ids.
+struct RouteDb {
+    db: Vec<Option<RouteAddr>>,
+}
+
+impl RouteDb {
+    // LOCAL_IO_ROUTE_ID is reserved.
+    const RESERVED_ROUTE_COUNT: usize = 1;
+
+    pub fn new() -> Self {
+        Self { db: vec![] }
+    }
+
+    // Mapping functions between a route ID and an index in the array. In particular, a fixed number of slots are
+    // reserved for special purposes like indicating local IO.
+    fn route_id_from_idx(idx: usize) -> RouteId {
+        RouteId((idx + Self::RESERVED_ROUTE_COUNT) as u16)
+    }
+
+    fn idx_from_route_id(id: RouteId) -> usize {
+        assert!(id.0 as usize >= Self::RESERVED_ROUTE_COUNT);
+        id.0 as usize - Self::RESERVED_ROUTE_COUNT
+    }
+
+    pub fn add_route(&mut self, new_route: &RouteAddr) -> RouteId {
+        // Don't allow adding a route that we already know about. The caller should have used `lookup_id` first if that
+        // were a possibility.
+        assert!(self.lookup_idx_opt(new_route).is_none());
+
+        // Find any empty slot to reuse.
+        let idx = if let Some((idx, _)) = self
+            .db
+            .iter()
+            .enumerate()
+            .find(|(_, ra_opt)| ra_opt.is_none())
+        {
+            self.db[idx] = Some(new_route.clone());
+            idx
+
+        // If there were no empty slots, add a new one and fill it.
+        } else {
+            self.db.push(Some(new_route.clone()));
+            self.db.len() - 1
+        };
+
+        Self::route_id_from_idx(idx)
+    }
+
+    pub fn remove_route(&mut self, route_id: RouteId) {
+        let idx = Self::idx_from_route_id(route_id);
+        assert!(self.db[idx].is_some());
+        self.db[idx] = None;
+    }
+
+    pub fn lookup_addr(&self, route_id: RouteId) -> &RouteAddr {
+        let idx = Self::idx_from_route_id(route_id);
+        self.db[idx].as_ref().unwrap()
+    }
+
+    fn lookup_idx_opt(&self, addr: &RouteAddr) -> Option<usize> {
+        self.db
+            .iter()
+            .enumerate()
+            .find(|(_, ra_opt)| {
+                if let Some(existing_route_addr) = ra_opt {
+                    *existing_route_addr == *addr
+                } else {
+                    false
+                }
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    pub fn lookup_id(&self, addr: &RouteAddr) -> Option<RouteId> {
+        self.lookup_idx_opt(addr).map(Self::route_id_from_idx)
+    }
+}
+
 // This implements storage and lookup of "channels", which are pairs of remote peers that we should forward traffic
 // between but not cross over into other channels. Each channel consists of two routes, one for each remote peer. And
 // each route also contains the local address that receives traffic from that peer. This 4-tuple uniquely identifies the
-// path a packet takes when it arrives from one endpoint and should be forwarded to the other endpoint.
+// path a packet takes when it arrives from one endpoint and should be forwarded to the other endpoint. This stores
+// `RouteId`s for quicker comparison and can be translated into `RouteAddr`s using a `RouteDb`.
 struct ChannelMap {
-    channels: HashMap<RouteAddr, RouteAddr>,
+    channels: HashMap<RouteId, RouteId>,
 }
 
 impl ChannelMap {
@@ -279,44 +356,45 @@ impl ChannelMap {
 
     fn add_route<'r>(
         &mut self,
-        new_route: &RouteAddr,
-        all_routes: impl Iterator<Item = &'r RouteAddr>,
+        new_route_id: RouteId,
+        all_routes: impl Iterator<Item = &'r RouteId>,
+        route_db: &RouteDb,
     ) {
+        let new_route_addr = route_db.lookup_addr(new_route_id);
+
         // Nobody should be adding a route that's already part of a channel.
         assert!(!self
             .channels
             .iter()
-            .any(|(ra1, ra2)| *ra1 == *new_route || *ra2 == *new_route));
+            .any(|(ra1, ra2)| *ra1 == new_route_id || *ra2 == new_route_id));
 
         // Check if there is any other route to pair it with.
-        for known_route_addr in all_routes {
+        for known_route_id in all_routes {
+            let known_route_addr = route_db.lookup_addr(*known_route_id);
+
             // Don't create channels between two ports on the same remote host. Channels are always between different
             // remote hosts. A gap here is that due to NATs, two different remote hosts might appear to come from the
             // same remote IP. A TODO would be to allow a config file or something to decide which remote peers
             // should be permitted to pair up in a channel together.
-            if known_route_addr.peer.ip() == new_route.peer.ip() {
+            if known_route_addr.peer.ip() == new_route_addr.peer.ip() {
                 continue;
             }
 
             // This route is already used in a channel, so it's not available to add to a new one.
-            if self.channels.get(known_route_addr).is_some() {
+            if self.channels.get(known_route_id).is_some() {
                 continue;
             }
 
             eprintln!(
                 "Creating channel between {} and {}",
-                known_route_addr, new_route
+                known_route_addr, new_route_addr
             );
 
             // Add the channel in both "directions" so it's easy to look up when routing traffic from either remote
             // endpoint.
-            let inserted = self
-                .channels
-                .insert(known_route_addr.clone(), new_route.clone());
+            let inserted = self.channels.insert(*known_route_id, new_route_id);
             assert!(inserted.is_none());
-            let inserted = self
-                .channels
-                .insert(new_route.clone(), known_route_addr.clone());
+            let inserted = self.channels.insert(new_route_id, *known_route_id);
             assert!(inserted.is_none());
 
             // A given route can only be part of at most one channel, so at this point since we added it to a channel,
@@ -325,31 +403,34 @@ impl ChannelMap {
         }
     }
 
-    fn get_dest_route(&self, route_addr: &RouteAddr) -> Option<&RouteAddr> {
-        self.channels.get(route_addr)
+    fn get_dest_route(&self, route_id: RouteId) -> Option<RouteId> {
+        self.channels.get(&route_id).map(std::clone::Clone::clone)
     }
 
-    fn remove_route(&mut self, route_addr: &RouteAddr) {
-        if let Some(route) = self.channels.get(route_addr) {
-            eprintln!("Removing failed channel {} <-> {}", route.local, route.peer);
-        }
+    fn remove_route(&mut self, route_id: RouteId, route_db: &RouteDb) {
+        if self.channels.contains_key(&route_id) {
+            eprintln!("Removing failed channel {}", route_db.lookup_addr(route_id));
 
-        // Since we store the channel in both "directions", remove all channels that reference the route to be removed.
-        self.channels
-            .retain(|ra1, ra2| route_addr != ra1 && route_addr != ra2);
+            // Since we store the channel in both "directions", remove all channels that reference the route to be
+            // removed.
+            self.channels
+                .retain(|ri1, ri2| route_id != *ri1 && route_id != *ri2);
+        }
     }
 }
 
-// An object that manages a set of known peers. It accepts data from one or more sockets and forwards incoming data
-// either just to the local output or to other known peers, depending on the forwarding mode. The reason it is
-// specific to TCP is because the sockets that it manages have the destination address embedded in them, unlike UDP,
-// where a single socket sends to multiple destinations.
+// An object that manages a set of sockets connected to known peers. It accepts data from one or more sockets and
+// forwards incoming data either just to the local output or to other known peers, depending on the forwarding mode. The
+// reason it is specific to TCP is because the sockets that it manages have the destination address embedded in them,
+// unlike UDP, where a single socket sends to multiple destinations.
 struct TcpRouter<'a> {
     args: &'a NcArgs,
 
-    // A collection of known remote peers, indexed by the remote peer address. Each known peer has a sink that is used
-    // for the router to send data to that peer.
-    routes: HashMap<RouteAddr, RouterToNetSink<'a>>,
+    route_db: RouteDb,
+
+    // A collection of known remote peers, indexed by the route id. Each known peer has a sink that is used for the
+    // router to send data to that peer.
+    routes: HashMap<RouteId, RouterToNetSink<'a>>,
 
     // Storage for channels, which are associations of two remote endpoints together for forwarding to each other but
     // not to other channels.
@@ -386,6 +467,7 @@ impl<'a> TcpRouter<'a> {
 
         Self {
             args,
+            route_db: RouteDb::new(),
             routes: HashMap::new(),
             channels: ChannelMap::new(),
             router_sink,
@@ -402,20 +484,26 @@ impl<'a> TcpRouter<'a> {
     // Callers use this to add a new destination to the router for forwarding. The caller passes in the part of the TCP
     // socket that the router can use to write data to the socket, and it returns a sink where the caller can write data
     // to the router.
-    pub fn add_route(&mut self, tx_socket: tokio::net::tcp::OwnedWriteHalf) -> RouterSink {
+    pub fn add_route(
+        &mut self,
+        tx_socket: tokio::net::tcp::OwnedWriteHalf,
+    ) -> (RouteId, RouterSink) {
         let new_route = RouteAddr {
             local: tx_socket.local_addr().unwrap(),
             peer: tx_socket.peer_addr().unwrap(),
         };
 
+        let route_id = self.route_db.add_route(&new_route);
+
         // Store the sink where the router will send data that should go to this destination.
         let router_to_net_sink: RouterToNetSink =
             Box::pin(FramedWrite::new(tx_socket, BytesCodec::new()));
 
-        self.routes.insert(new_route.clone(), router_to_net_sink);
+        self.routes.insert(route_id, router_to_net_sink);
 
         if self.args.is_using_channels() {
-            self.channels.add_route(&new_route, self.routes.keys());
+            self.channels
+                .add_route(route_id, self.routes.keys(), &self.route_db);
         }
 
         // Don't add the local IO hookup until the first client is added, otherwise the router will pull all the data
@@ -428,28 +516,40 @@ impl<'a> TcpRouter<'a> {
 
         // The input end of the router (`router_sink`) can be cloned to allow multiple callers to pass data into the
         // same channel.
-        self.router_sink.clone()
+        (route_id, self.router_sink.clone())
     }
 
-    pub fn remove_route(&mut self, route: &RouteAddr) {
-        Self::cleanup_route(route, self.args, &mut self.routes, &mut self.channels);
+    pub fn lookup_route_addr(&self, route_id: RouteId) -> &RouteAddr {
+        self.route_db.lookup_addr(route_id)
+    }
+
+    pub fn remove_route(&mut self, route_id: RouteId) {
+        Self::cleanup_route(
+            route_id,
+            self.args,
+            &mut self.route_db,
+            &mut self.routes,
+            &mut self.channels,
+        );
+
+        // Only cleanup the route id when called from outside the router, which means that the calling code will also no
+        // longer try to reference the route id.
+        self.route_db.remove_route(route_id);
     }
 
     // This is an associated function because in some codepaths I've already mutably borrowed `self`, so this accepts
     // just the parts of the object that need to be modified.
     fn cleanup_route(
-        route: &RouteAddr,
+        route_id: RouteId,
         args: &NcArgs,
-        routes: &mut HashMap<RouteAddr, RouterToNetSink>,
+        route_db: &mut RouteDb,
+        routes: &mut HashMap<RouteId, RouterToNetSink>,
         channels: &mut ChannelMap,
     ) {
-        let removed = routes.remove(route);
-
-        // It's possible this route has already been cleaned up because the router noticed when forwarding to it that it
-        // was closed.
-        if removed.is_none() {
-            return;
-        }
+        // It's possible this route has already been cleaned up or partially cleaned up because the router noticed when
+        // forwarding to it that it was closed, or that it was closed as the other end of a channel. Still go through
+        // and clean up any lingering state anyway.
+        let _removed = routes.remove(&route_id);
 
         // In channels mode, if a socket at one end of a channel is disconnected, the socket at the other end should
         // also be disconnected, because most programs don't expect upon reconnection to encounter the same socket state
@@ -458,14 +558,25 @@ impl<'a> TcpRouter<'a> {
         if args.forwarding_mode == ForwardingMode::Channels {
             // Make sure to grab this before removing the channel below, which would delete this information from the
             // channel map.
-            if let Some(channel_dest) = channels.get_dest_route(route) {
-                eprintln!("Also disconnecting other end of channel: {}", channel_dest);
-                let removed = routes.remove(channel_dest);
+            if let Some(channel_dest) = channels.get_dest_route(route_id) {
+                // We should only be cleaning up the other end of the channel when we remove the main route. Either both
+                // sides of the channel are in the channel map or neither are.
+                assert!(_removed.is_some());
+
+                eprintln!(
+                    "Also disconnecting other end of channel: {}",
+                    route_db.lookup_addr(channel_dest)
+                );
+
+                // This doesn't do a full `cleanup_route` because the code outside the router still needs to notice the
+                // disconnection, print out info for the user, and cleanup any of its state before calling back in to
+                // do the rest of the cleanup.
+                let removed = routes.remove(&channel_dest);
                 assert!(removed.is_some());
             }
         }
 
-        channels.remove_route(route);
+        channels.remove_route(route_id, route_db);
 
         // TODO: consider at this point looping through all the routes and deciding if we need to pair up new ones.
     }
@@ -494,7 +605,7 @@ impl<'a> TcpRouter<'a> {
                     }
 
                     // If local IO sent an empty message, that means it was closed.
-                    if sb.data.is_empty() && sb.route.peer == LOCAL_IO_PEER_ADDR {
+                    if sb.data.is_empty() && sb.route_id == LOCAL_IO_ROUTE_ID {
                         // The user asked to exit the program after the input stream closed. Clear all the routes, which
                         // will cause graceful disconnections on all of them. Mark the router as done so the caller can
                         // know not to do further work.
@@ -512,21 +623,21 @@ impl<'a> TcpRouter<'a> {
                         }
                     }
 
-                    let mut broken_routes = RouteAddrSet::new();
+                    let mut broken_routes = RouteIdSet::new();
                     let mut did_send = false;
-                    if self.args.is_using_channels() {
+                    if self.args.is_using_channels() && sb.route_id != LOCAL_IO_ROUTE_ID {
                         // Look up whether this incoming route has a corresponding destination route in a channel.
-                        if let Some(channel_dest) = self.channels.get_dest_route(&sb.route) {
+                        if let Some(channel_dest) = self.channels.get_dest_route(sb.route_id) {
                             if self.args.verbose {
-                                eprintln!("Forwarding on channel {} -> {}", sb.route, channel_dest);
+                                eprintln!("Forwarding on channel {} -> {}", self.route_db.lookup_addr(sb.route_id), channel_dest);
                             }
 
                             // Look up the sink to send to for this route. There always is one, so `unwrap` is OK.
-                            let dest_sink = self.routes.get_mut(channel_dest).unwrap();
+                            let dest_sink = self.routes.get_mut(&channel_dest).unwrap();
 
                             if let Err(e) = dest_sink.send(sb.data.clone()).await {
-                                eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
-                                broken_routes.insert(channel_dest.clone());
+                                eprintln!("Error forwarding on channel to {}. {}", self.route_db.lookup_addr(channel_dest), e);
+                                broken_routes.insert(channel_dest);
                             } else {
                                 stats_tracker.record_send(&sb.data);
                             }
@@ -534,7 +645,7 @@ impl<'a> TcpRouter<'a> {
                             did_send = true;
                         } else {
                             if self.args.verbose {
-                                eprintln!("Dropping message from {}. No channel found.", sb.route);
+                                eprintln!("Dropping message from {}. No channel found.", self.route_db.lookup_addr(sb.route_id));
                             }
                         }
                     }
@@ -547,20 +658,20 @@ impl<'a> TcpRouter<'a> {
                         // should go to. Track any failed sends so they can be pruned from the list of known routes
                         // after.
                         for (dest_route, dest_sink) in self.routes.iter_mut() {
-                            if !should_forward_to(self.args, &sb.route.peer, &dest_route.peer) {
+                            if !should_forward_to(self.args, sb.route_id, *dest_route) {
                                 continue;
                             }
 
                             if self.args.verbose {
-                                eprintln!("Forwarding to {}", dest_route.peer);
+                                eprintln!("Forwarding {}", self.route_db.lookup_addr(*dest_route));
                             }
 
                             // It could be possible to omit the peer address for the TcpRouter, because the peer address
                             // is implicit with the socket, but I'm going to keep it this way for symmetry for now,
                             // until it becomes a perf problem.
                             if let Err(e) = dest_sink.send(sb.data.clone()).await {
-                                eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
-                                broken_routes.insert(dest_route.clone());
+                                eprintln!("Error forwarding to {}. {}", self.route_db.lookup_addr(*dest_route), e);
+                                broken_routes.insert(*dest_route);
                             } else {
                                 stats_tracker.record_send(&sb.data);
                             }
@@ -568,7 +679,7 @@ impl<'a> TcpRouter<'a> {
                     }
 
                     // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
-                    if sb.route.peer != LOCAL_IO_PEER_ADDR {
+                    if sb.route_id != LOCAL_IO_ROUTE_ID {
                         stats_tracker.record_recv(&sb.data);
                         if let Some(ref mut local_output_sink) = local_output_sink_opt {
                             // If we hit an error emitting output, clear out the local output sink so we don't bother
@@ -584,7 +695,7 @@ impl<'a> TcpRouter<'a> {
                     // which would just result in more errors.
                     if !broken_routes.is_empty() {
                         for route in broken_routes.iter() {
-                            Self::cleanup_route(route, self.args, &mut self.routes, &mut self.channels);
+                            Self::cleanup_route(*route, self.args, &mut self.route_db, &mut self.routes, &mut self.channels);
                         }
                     }
 
@@ -1258,12 +1369,8 @@ async fn do_tcp(
                     // If we were able to connect to a candidate, add them to the router so they can send and receive
                     // traffic.
                     let (rx_socket, tx_socket) = tcp_stream.into_split();
-                    let net_to_router_sink = router.add_route(tx_socket);
-                    outbound_connections.push(handle_tcp_stream(
-                        rx_socket,
-                        args,
-                        net_to_router_sink,
-                    ));
+                    let route_info = router.add_route(tx_socket);
+                    outbound_connections.push(handle_tcp_stream(rx_socket, args, route_info));
 
                     // Stop after first successful connection for this target.
                     succeeded_any_connection = true;
@@ -1340,8 +1447,8 @@ async fn do_tcp(
                         // Track the accepted TCP socket here. This future will complete when the socket disconnects.
                         // At the same time, make it known to the router so it can service traffic to and from it.
                         let (rx_socket, tx_socket) = tcp_stream.into_split();
-                        let net_to_router_sink = router.add_route(tx_socket);
-                        inbound_connections.push(handle_tcp_stream(rx_socket, args, net_to_router_sink));
+                        let route_info = router.add_route(tx_socket);
+                        inbound_connections.push(handle_tcp_stream(rx_socket, args, route_info));
                     }
                     Err(e) => {
                         // If there was an error accepting a connection, bail out if the user asked to listen only once.
@@ -1354,7 +1461,8 @@ async fn do_tcp(
                     }
                 }
             },
-            (stream_result, route_addr) = inbound_connections.select_next_some() => {
+            (stream_result, route_id) = inbound_connections.select_next_some() => {
+                let route_addr = router.lookup_route_addr(route_id).clone();
                 match stream_result {
                     Ok(_) => {
                         eprintln!("Connection {} closed gracefully.", route_addr);
@@ -1372,9 +1480,10 @@ async fn do_tcp(
                 }
 
                 // Notify the router that a connection failed so it can clean it up.
-                router.remove_route(&route_addr);
+                router.remove_route(route_id);
             },
-            (result, route_addr) = outbound_connections.select_next_some() => {
+            (result, route_id) = outbound_connections.select_next_some() => {
+                let route_addr = router.lookup_route_addr(route_id).clone();
                 // A TcpStream ended. Print out some status and potentially reconnect to it.
                 let should_reconnect =
                     match result {
@@ -1395,7 +1504,7 @@ async fn do_tcp(
                 if !router.is_done {
                     // Notify the router that a connection failed so it can clean it up. Possible that this happened
                     // because the router itself closed the route, in which case this will have no effect.
-                    router.remove_route(&route_addr);
+                    router.remove_route(route_id);
 
                     // When reconnecting, just do another connection and add it to the list of ongoing connections
                     // being tracked.
@@ -1405,11 +1514,11 @@ async fn do_tcp(
                                 // If we were able to connect to a candidate, add them to the router so they can
                                 // send and receive traffic.
                                 let (rx_socket, tx_socket) = tcp_stream.into_split();
-                                let net_to_router_sink = router.add_route(tx_socket);
+                                let route_info = router.add_route(tx_socket);
                                 outbound_connections.push(handle_tcp_stream(
                                     rx_socket,
                                     args,
-                                    net_to_router_sink
+                                    route_info,
                                 ));
                             }
                             Err(e) => {
@@ -1440,34 +1549,33 @@ async fn do_tcp(
 async fn handle_tcp_stream(
     rx_socket: tokio::net::tcp::OwnedReadHalf,
     args: &NcArgs,
-    mut net_to_router_sink: RouterSink,
-) -> (std::io::Result<()>, RouteAddr) {
-    let route_addr = RouteAddr::from_tcp_stream(&rx_socket);
-
+    (route_id, mut net_to_router_sink): (RouteId, RouterSink),
+) -> (std::io::Result<()>, RouteId) {
     // In Zero-IO mode, immediately close the socket. Otherwise, handle it like normal.
     if args.is_zero_io {
-        return (Ok(()), route_addr);
+        return (Ok(()), route_id);
     }
 
     // Set up a stream that produces chunks of data from the network. The sink into the router requires SourcedBytes
-    // that include the remote peer's address. Also have to convert from BytesMut (which the socket read provides) to
-    // just Bytes. If any read error occurs, bubble it up to the disconnection event.
+    // that include the route id, which can be mapped to the remote peer's address. Also have to convert from BytesMut
+    // (which the socket read provides) to just Bytes. If any read error occurs, bubble it up to the disconnection
+    // event.
     let mut net_to_router_stream = FramedRead::new(rx_socket, BytesCodec::new()).map(|bm_res| {
-        // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
+        // freeze() to convert BytesMut into Bytes. Add the route id as required for SourcedBytes.
         bm_res.map(|bm| SourcedBytes {
             data: bm.freeze(),
-            route: route_addr.clone(),
+            route_id,
         })
     });
 
-    // End when the socket is closed. Return the final error along with the peer address that this socket was connected
-    // to, so the program can tell the user which socket closed.
+    // End when the socket is closed. Return the final error along with the route id that identifies this socket and the
+    // remote peer, so the program can tell the user which socket closed.
     (
         net_to_router_sink
             .send_all(&mut net_to_router_stream)
             .fuse()
             .await,
-        route_addr,
+        route_id,
     )
 }
 
@@ -1623,6 +1731,10 @@ async fn handle_udp_sockets(
         );
     }
 
+    // This has to be accessed on each UDP stream's async task, because that's where `RouteAddr`s are turned into
+    // `RouteId`s.
+    let route_db = Arc::new(std::sync::RwLock::new(RouteDb::new()));
+
     let (router_sink, mut inbound_net_traffic_stream) = mpsc::unbounded();
     let mut router_sink = router_sink
         .sink_map_err(map_unbounded_sink_err_to_io_err as fn(mpsc::SendError) -> std::io::Error);
@@ -1636,11 +1748,12 @@ async fn handle_udp_sockets(
     // A collection of all inbound traffic going to the router.
     let mut net_to_router_flows = FuturesUnordered::new();
 
-    // Collect one sink per local socket address that can be used to send data out of that socket.
+    // Collect one sink per local socket that can be used to send data out of that socket.
     let mut socket_sinks = HashMap::new();
     for socket in sockets.iter() {
         // Create a sink and stream for the socket. The sink accepts Bytes and a destination address and turns that into
-        // a sendto. The stream produces a Bytes for an incoming datagram and includes the remote source address.
+        // a sendto. The stream produces a Bytes for an incoming datagram and includes a route id which can be
+        // translated by the `RouteDb` into a local and remote address.
         let local_addr = socket.local_addr().unwrap();
         let framed = tokio_util::udp::UdpFramed::new(socket.clone(), BytesCodec::new());
         let (socket_sink, socket_stream) = framed.split();
@@ -1650,17 +1763,36 @@ async fn handle_udp_sockets(
         // Clone before because this is moved into the async block.
         let mut router_sink = router_sink.clone();
 
-        // Track a future that drives all traffic from the network to the router.
+        // Get a new reference to the `RouteDb` to move into the async task to handle the stream.
+        let route_db_for_stream = route_db.clone();
+
+        // Track a future that drives all traffic from this socket to the router.
         net_to_router_flows.push(async move {
             let mut socket_stream = socket_stream.filter_map(|bm_res| match bm_res {
-                // freeze() to convert BytesMut into Bytes. Add the peer_addr as required for SourcedBytes.
-                Ok((bm, peer_addr)) => future::ready(Some(Ok(SourcedBytes {
-                    data: bm.freeze(),
-                    route: RouteAddr {
+                Ok((bm, peer_addr)) => {
+                    let route_addr = RouteAddr {
                         local: local_addr,
                         peer: peer_addr,
-                    },
-                }))),
+                    };
+
+                    // On every UDP receive we have to map the route address to a route id, which is what is passed
+                    // along in a `SourcedBytes`. First look up the route to see if it's already known by the db. This
+                    // is the common case, so most of the time we incur the cost of only a reader lock. Rarely, a new
+                    // route needs to be added, and we'll incur the cost of a writer lock.
+                    let route_id_opt = route_db_for_stream.read().unwrap().lookup_id(&route_addr);
+
+                    // Make sure to use unwrap_or_else, or the `add_route` call will be made even if `route_id_opt` is
+                    // Some.
+                    let route_id = route_id_opt.unwrap_or_else(|| {
+                        route_db_for_stream.write().unwrap().add_route(&route_addr)
+                    });
+
+                    // freeze() to convert BytesMut into Bytes. Add the route id as required for SourcedBytes.
+                    future::ready(Some(Ok(SourcedBytes {
+                        data: bm.freeze(),
+                        route_id,
+                    })))
+                }
                 Err(e) => {
                     // At the point we receive an error from the socket, there isn't a good way to figure out what
                     // caused it. It might have been the whole network stack going down, or it might have been an ICMP
@@ -1688,13 +1820,15 @@ async fn handle_udp_sockets(
     // The user may specify a set of initial peers to be aware of and send traffic to. That is typical of outbound
     // scenarios. For inbound-only scenarios, no initial peers are specified because they aren't known yet.
     for route in initial_routes.iter() {
+        let route_id = route_db.write().unwrap().add_route(&route);
+
         print_udp_assoc(&route);
-        let added = known_routes.insert(route.clone());
+        let added = known_routes.insert(route_id);
         assert!(added);
         lifetime_client_count += 1;
 
         if args.is_using_channels() {
-            channels.add_route(route, known_routes.iter());
+            channels.add_route(route_id, known_routes.iter(), &route_db.read().unwrap());
         }
 
         if lifetime_client_count == 1 {
@@ -1723,7 +1857,7 @@ async fn handle_udp_sockets(
                 }
 
                 // If local IO sent an empty message, that means it was closed.
-                if sb.data.is_empty() && sb.route.peer == LOCAL_IO_PEER_ADDR {
+                if sb.data.is_empty() && sb.route_id == LOCAL_IO_ROUTE_ID {
                     // The user asked to exit the program after the input stream closed.
                     if args.should_exit_after_input_closed {
                         // Before quitting and therefore disconnecting all the sockets, give a small amount of time to
@@ -1741,13 +1875,13 @@ async fn handle_udp_sockets(
                 //
                 // If joining a multicast group, don't do this, because it'll end up adding duplicate peers who were
                 // going to receive traffic from the multicast group anyway.
-                if !args.should_join_multicast_group && sb.route.peer != LOCAL_IO_PEER_ADDR && known_routes.insert(sb.route.clone()) {
+                if !args.should_join_multicast_group && sb.route_id != LOCAL_IO_ROUTE_ID && known_routes.insert(sb.route_id) {
                     lifetime_client_count += 1;
 
-                    print_udp_assoc(&sb.route);
+                    print_udp_assoc(route_db.read().unwrap().lookup_addr(sb.route_id));
 
                     if args.is_using_channels() {
-                        channels.add_route(&sb.route, known_routes.iter());
+                        channels.add_route(sb.route_id, known_routes.iter(), &route_db.read().unwrap());
                     }
 
                     // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
@@ -1760,23 +1894,25 @@ async fn handle_udp_sockets(
                     }
                 }
 
-                let mut broken_routes = RouteAddrSet::new();
+                let mut broken_routes = RouteIdSet::new();
                 let mut did_send = false;
 
                 // If using channel routing, look up if there's a known channel that this incoming packet should be
                 // forwarded to.
                 if args.is_using_channels() {
-                    if let Some(channel_dest) = channels.get_dest_route(&sb.route) {
+                    if let Some(channel_dest) = channels.get_dest_route(sb.route_id) {
+                        let channel_dest_route_addr = route_db.read().unwrap().lookup_addr(channel_dest).clone();
+
                         if args.verbose {
-                            eprintln!("Forwarding on channel {} -> {}", sb.route, channel_dest);
+                            eprintln!("Forwarding on channel {} -> {}", route_db.read().unwrap().lookup_addr(sb.route_id), channel_dest_route_addr);
                         }
 
                         // There should always be a backing sink for any channel route.
-                        let dest_sink = socket_sinks.get_mut(&channel_dest.local).unwrap();
+                        let dest_sink = socket_sinks.get_mut(&channel_dest_route_addr.local).unwrap();
 
-                        if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest.peer)).await {
-                            eprintln!("Error forwarding on channel to {}. {}", channel_dest.peer, e);
-                            broken_routes.insert(channel_dest.clone());
+                        if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest_route_addr.peer)).await {
+                            eprintln!("Error forwarding on channel to {}. {}", channel_dest_route_addr.peer, e);
+                            broken_routes.insert(channel_dest);
                         } else {
                             stats_tracker.record_send(&sb.data);
                         }
@@ -1784,7 +1920,7 @@ async fn handle_udp_sockets(
                         did_send = true;
                     } else {
                         if args.verbose {
-                            eprintln!("Dropping message from {}. No channel found.", sb.route);
+                            eprintln!("Dropping message from {}. No channel found.", route_db.read().unwrap().lookup_addr(sb.route_id));
                         }
                     }
                 }
@@ -1797,27 +1933,30 @@ async fn handle_udp_sockets(
                 // to. Track any failed sends so they can be pruned from the list of known routes after.
                 if !did_send {
                     for dest_route in known_routes.iter() {
-                        if !should_forward_to(args, &sb.route.peer, &dest_route.peer) {
+                        let dest_route_addr = route_db.read().unwrap().lookup_addr(*dest_route).clone();
+                        if !should_forward_to(args, sb.route_id, *dest_route) {
                             continue;
                         }
 
                         if args.verbose {
-                            eprintln!("Forwarding to {}", dest_route.peer);
+                            eprintln!("Forwarding to {}", dest_route_addr);
                         }
 
-                        if let Some(socket_sink) = socket_sinks.get_mut(&dest_route.local) {
-                            if let Err(e) = socket_sink.send((sb.data.clone(), dest_route.peer)).await {
-                                eprintln!("Error forwarding to {}. {}", dest_route.peer, e);
-                                broken_routes.insert(dest_route.clone());
+                        if let Some(socket_sink) = socket_sinks.get_mut(&dest_route_addr.local) {
+                            if let Err(e) = socket_sink.send((sb.data.clone(), dest_route_addr.peer)).await {
+                                eprintln!("Error forwarding to {}. {}", dest_route_addr.peer, e);
+                                broken_routes.insert(*dest_route);
                             } else {
                                 stats_tracker.record_send(&sb.data);
                             }
+                        } else {
+                            eprintln!("No sink found for {}", dest_route_addr.local);
                         }
                     }
                 }
 
                 // Came from a remote endpoint, so also send to local IO.
-                if sb.route.peer != LOCAL_IO_PEER_ADDR {
+                if sb.route_id != LOCAL_IO_ROUTE_ID {
                     stats_tracker.record_recv(&sb.data);
                     if let Some(ref mut local_output_sink) = local_output_sink_opt {
                         // If we hit an error emitting output, clear out the local output sink so we don't bother
@@ -1834,7 +1973,15 @@ async fn handle_udp_sockets(
                 if !broken_routes.is_empty() {
                     for route in broken_routes.iter() {
                         known_routes.remove(route);
-                        channels.remove_route(route);
+
+                        if args.is_using_channels() {
+                            if let Some(channel_dest) = channels.get_dest_route(*route) {
+                                channels.remove_route(channel_dest, &route_db.read().unwrap());
+                            }
+                        }
+
+                        channels.remove_route(*route, &route_db.read().unwrap());
+                        route_db.write().unwrap().remove_route(*route);
                     }
                 }
 
