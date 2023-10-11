@@ -1,4 +1,3 @@
-// TODO knutaf fmt
 // For AsFd/AsSocket shenanigans.
 #![feature(trait_alias)]
 
