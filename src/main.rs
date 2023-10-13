@@ -954,7 +954,7 @@ where
 
             result
         })
-        .map(|res| res.unwrap())
+        .map(std::result::Result::unwrap)
         .fuse(),
     )
 }
@@ -981,7 +981,7 @@ impl RandBytesIter {
                 // in the original array, so map and dereference to return u8 instead of &u8.
                 let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
                     .unwrap()
-                    .map(|e| *e);
+                    .map(std::clone::Clone::clone);
 
                 Box::new(rand::thread_rng().sample_iter(ascii_dist))
             }
@@ -1430,7 +1430,7 @@ async fn do_tcp(
         // Try accepting on all listening sockets. The future will complete when any accept goes through.
         let mut accepts = listeners
             .iter()
-            .map(|listener| listener.accept())
+            .map(tokio::net::TcpListener::accept)
             .collect::<FuturesUnordered<_>>();
 
         futures::select! {
@@ -2349,7 +2349,7 @@ async fn async_main() -> Result<(), String> {
     let outbound_source_addrs = get_local_addrs(
         args.outbound_source_host_opt
             .iter()
-            .map(|s: &String| s.as_str()),
+            .map(String::as_str),
         true,
         &args,
     )
@@ -2368,7 +2368,7 @@ async fn async_main() -> Result<(), String> {
     // If the user didn't pass `-l` or `-L`, then we shouldn't listen on any addresses. Pass `false` to get_local_addrs
     // to prevent it from automatically including the wildcard local addresses.
     let listen_addrs =
-        get_local_addrs(listen_addr_strings.iter().map(|s| s.as_str()), false, &args)
+        get_local_addrs(listen_addr_strings.iter().map(String::as_str), false, &args)
             .await
             .map_err(format_io_err)?;
 
