@@ -237,7 +237,10 @@ lazy_static! {
 // Core logic used by the router to decide where to forward messages, generally used when not in channel mode.
 fn should_forward_to(args: &NcArgs, source: RouteId, dest: RouteId) -> bool {
     // In echo mode, allow sending data back to the source.
-    if source == dest && args.input_mode != InputMode::Echo {
+    if source == dest
+        && args.input_mode != InputMode::Echo
+        && args.input_mode != InputMode::PfQosServer
+    {
         if args.verbose {
             eprintln!("Skipping forwarding back to source.");
         }
@@ -1175,8 +1178,9 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
 
     match args.input_mode {
         // Echo mode doesn't have a stream that produces data for sending. That will come directly from the sockets that
-        // send data to this machine. It's handled in the routing code.
-        InputMode::Null | InputMode::Echo => (
+        // send data to this machine. It's handled in the routing code. PfQosServer is basically echo mode with a little
+        // extra logic before sending.
+        InputMode::Null | InputMode::Echo | InputMode::PfQosServer => (
             setup_local_output(args),
             Box::pin(futures::future::pending()),
         ),
@@ -1983,9 +1987,19 @@ async fn handle_udp_sockets(
                 // The streams in this collection never return error and so should never end.
                 panic!("net_to_router_flow ended! {:?}", result);
             },
-            sb = inbound_net_traffic_stream.select_next_some() => {
+            mut sb = inbound_net_traffic_stream.select_next_some() => {
                 if args.verbose {
                     eprintln!("Router handling traffic: {:?}", sb);
+                }
+
+                if args.input_mode == InputMode::PfQosServer {
+                    // If this is a valid PfQos request, switch the request header into the response header for sending
+                    // back.
+                    if sb.data[..PFQOS_FIXED_REQUEST_PREFIX.len()] == PFQOS_FIXED_REQUEST_PREFIX {
+                        let mut response_data = BytesMut::from(&sb.data[..]);
+                        response_data[..PFQOS_FIXED_RESPONSE_PREFIX.len()].copy_from_slice(&PFQOS_FIXED_RESPONSE_PREFIX[..]);
+                        sb.data = response_data.freeze();
+                    }
                 }
 
                 if sb.route_id == LOCAL_IO_ROUTE_ID {
@@ -2200,6 +2214,10 @@ enum InputMode {
     /// Act as a client for PlayFab Quality of Service beacon servers, measuring round trip latency.
     #[value(name = "pfqoscli")]
     PfQosClient,
+
+    /// Act as PlayFab Quality of Service beacon servers, for clients to send latency measurement pings to.
+    #[value(name = "pfqossrv")]
+    PfQosServer,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
@@ -2457,8 +2475,13 @@ async fn async_main() -> Result<(), String> {
         _ => {}
     }
 
-    if args.input_mode == InputMode::PfQosClient && !args.is_udp {
-        usage("pfqoscli input mode requires UDP.");
+    match args.input_mode {
+        InputMode::PfQosClient | InputMode::PfQosServer => {
+            if !args.is_udp {
+                usage("pfqos* input modes require UDP.");
+            }
+        }
+        _ => {}
     }
 
     let mut targets: Vec<ConnectionTarget> = vec![];
