@@ -19,6 +19,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
@@ -82,8 +83,11 @@ const DEFAULT_INPUT_MODE: InputMode = if cfg!(unix) {
 // sockets even when it's not a real socket (and therefore doesn't have a real network address).
 const LOCAL_IO_ROUTE_ID: RouteId = RouteId(0);
 
-// Emit stats every 1 sec.
-const STATS_OUTPUT_PERIOD: std::time::Duration = std::time::Duration::new(1, 0);
+// From https://learn.microsoft.com/en-us/gaming/playfab/features/multiplayer/servers/using-qos-beacons-to-measure-player-latency-to-azure
+// First byte must be 0xFFFF in the datagram to the QoS beacon server. Reply starts with 0x0000 and then echoes the
+// request content.
+const PFQOS_FIXED_REQUEST_PREFIX: [u8; 2] = [0xffu8, 0xffu8];
+const PFQOS_FIXED_RESPONSE_PREFIX: [u8; 2] = [0u8, 0u8];
 
 // A buffer of bytes that carries a route id, which represents both the remote peer that sent it to this machine and the
 // local address it was destined for. Used for figuring out which remote machines it should be forwarded to.
@@ -174,15 +178,17 @@ struct Stats {
 }
 
 struct StatsTracker {
+    output_period: Duration,
     stats_since_last_log: Stats,
-    last_log_time: std::time::Instant,
+    last_log_time: Instant,
 }
 
 impl StatsTracker {
-    fn new() -> Self {
+    fn new(args: &NcArgs) -> Self {
         Self {
+            output_period: Duration::from_millis(args.stats_period as u64),
             stats_since_last_log: Stats::default(),
-            last_log_time: std::time::Instant::now(),
+            last_log_time: Instant::now(),
         }
     }
 
@@ -197,8 +203,8 @@ impl StatsTracker {
     }
 
     fn try_consume_stats(&mut self) -> Option<Stats> {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_log_time) > STATS_OUTPUT_PERIOD {
+        let now = Instant::now();
+        if now.duration_since(self.last_log_time) > self.output_period {
             let ret = self.stats_since_last_log.clone();
             self.stats_since_last_log = Stats::default();
             self.last_log_time = now;
@@ -257,11 +263,93 @@ fn should_forward_to(args: &NcArgs, source: RouteId, dest: RouteId) -> bool {
     true
 }
 
+#[derive(Clone)]
+struct LatencyStats {
+    latest_send_time: Instant,
+    latest_send_data: Bytes,
+    latest_rtt: Option<Duration>,
+}
+
+impl LatencyStats {
+    pub fn new() -> Self {
+        Self {
+            latest_send_time: Instant::now(),
+            latest_send_data: Bytes::new(),
+            latest_rtt: None,
+        }
+    }
+
+    pub fn record_send(&mut self, data: Bytes) {
+        self.latest_send_time = Instant::now();
+        self.latest_send_data = data;
+
+        // If a ping was sent and a caller immediately calls try_get_latest_rtt, it shouldn't get any answer until the
+        // response is recorded.
+        self.latest_rtt = None;
+    }
+
+    pub fn record_recv(&mut self, received_data: &Bytes, args: &NcArgs) {
+        // Calculate the RTT as soon as possible in case the checks below take too long and skew the results.
+        let potential_rtt = Instant::now().duration_since(self.latest_send_time);
+
+        if received_data.len() < PFQOS_FIXED_RESPONSE_PREFIX.len() {
+            if args.verbose {
+                eprintln!(
+                    "Invalid PfQos response. {} bytes is too short!",
+                    received_data.len()
+                );
+            }
+            return;
+        }
+
+        let received_prefix = &received_data[..PFQOS_FIXED_RESPONSE_PREFIX.len()];
+        if received_prefix != &PFQOS_FIXED_RESPONSE_PREFIX[..] {
+            if args.verbose {
+                eprintln!("Invalid PfQos prefix! {:?}", received_prefix);
+            }
+            return;
+        }
+
+        let received_payload = &received_data[PFQOS_FIXED_RESPONSE_PREFIX.len()..];
+        let latest_sent_payload = &self.latest_send_data[PFQOS_FIXED_RESPONSE_PREFIX.len()..];
+        if received_payload != latest_sent_payload {
+            if args.verbose {
+                eprintln!(
+                    "Invalid PfQos payload! received {:?} != latest-sent {:?}",
+                    received_payload, latest_sent_payload
+                );
+            }
+            return;
+        }
+
+        // All validity checks succeeded, so record the RTT.
+        self.latest_rtt = Some(potential_rtt);
+    }
+
+    pub fn try_get_latest_rtt(&self) -> Option<Duration> {
+        self.latest_rtt
+    }
+}
+
+struct RouteInfo {
+    addr: RouteAddr,
+    latency_stats: LatencyStats,
+}
+
+impl RouteInfo {
+    fn new(addr: RouteAddr) -> Self {
+        Self {
+            addr,
+            latency_stats: LatencyStats::new(),
+        }
+    }
+}
+
 // A database that maps route addresses (64 bytes long!) to a much smaller `RouteId` (only a few bytes). The id ends up
 // just being the index in the internal array where the `RouteAddr` is stored, offset by a bit to account for specially
 // reserved route ids.
 struct RouteDb {
-    db: Vec<Option<RouteAddr>>,
+    db: Vec<Option<RouteInfo>>,
 }
 
 impl RouteDb {
@@ -293,14 +381,14 @@ impl RouteDb {
             .db
             .iter()
             .enumerate()
-            .find(|(_, ra_opt)| ra_opt.is_none())
+            .find(|(_, info_opt)| info_opt.is_none())
         {
-            self.db[idx] = Some(new_route.clone());
+            self.db[idx] = Some(RouteInfo::new(new_route.clone()));
             idx
 
         // If there were no empty slots, add a new one and fill it.
         } else {
-            self.db.push(Some(new_route.clone()));
+            self.db.push(Some(RouteInfo::new(new_route.clone())));
             self.db.len() - 1
         };
 
@@ -315,16 +403,21 @@ impl RouteDb {
 
     pub fn lookup_addr(&self, route_id: RouteId) -> &RouteAddr {
         let idx = Self::idx_from_route_id(route_id);
-        self.db[idx].as_ref().unwrap()
+        &self.db[idx].as_ref().unwrap().addr
+    }
+
+    pub fn get_latency_stats_mut(&mut self, route_id: RouteId) -> &mut LatencyStats {
+        let idx = Self::idx_from_route_id(route_id);
+        &mut self.db[idx].as_mut().unwrap().latency_stats
     }
 
     fn lookup_idx_opt(&self, addr: &RouteAddr) -> Option<usize> {
         self.db
             .iter()
             .enumerate()
-            .find(|(_, ra_opt)| {
-                if let Some(existing_route_addr) = ra_opt {
-                    *existing_route_addr == *addr
+            .find(|(_, info_opt)| {
+                if let Some(existing_route_info) = info_opt {
+                    existing_route_info.addr == *addr
                 } else {
                     false
                 }
@@ -585,7 +678,7 @@ impl<'a> TcpRouter<'a> {
         // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
         let mut local_output_sink_opt = Some(&mut self.local_output_sink);
 
-        let mut stats_tracker = StatsTracker::new();
+        let mut stats_tracker = StatsTracker::new(&self.args);
 
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
         // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
@@ -747,7 +840,11 @@ fn map_drain_sink_err_to_io_err(_err: std::convert::Infallible) -> std::io::Erro
 // For iterators, we shouldn't yield items as quickly as possible, or else the runtime sometimes doesn't give enough
 // processing time to other tasks. This creates a stream out of an iterator but also makes sure to yield after every
 // element to make sure it can flow through the rest of the system.
-fn local_input_driver_from_iter<TIter>(iter: TIter, mut router_sink: RouterSink) -> LocalInputDriver
+fn local_input_driver_from_iter<TIter>(
+    iter: TIter,
+    delay: Duration,
+    mut router_sink: RouterSink,
+) -> LocalInputDriver
 where
     TIter: Iterator<Item = std::io::Result<Bytes>> + 'static,
 {
@@ -755,7 +852,11 @@ where
     Box::pin(
         async move {
             let mut stream = Box::pin(futures::stream::iter(iter).then(|e| async {
-                tokio::task::yield_now().await;
+                if delay == Duration::ZERO {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 e.map(SourcedBytes::create_with_local_source)
             }));
 
@@ -965,10 +1066,13 @@ struct RandBytesIter {
     config: RandConfig,
     rand_iter: Box<dyn Iterator<Item = u8>>,
     rng: rand::rngs::ThreadRng,
+    fixed_prefix: Bytes,
 }
 
+// Despite the name, this can also be used to send a fixed, unchanging payload repeatedly, if you pass `config.size_max`
+// as zero. `new_fixed` is provided as a convenience method to create such an iterator.
 impl RandBytesIter {
-    fn new(config: &RandConfig) -> RandBytesIter {
+    fn new(config: &RandConfig, fixed_prefix: Bytes) -> Self {
         // Decide the type of data to be produced, depending on user choice. Have to specify the dynamic type here
         // because the match arms have different concrete types (different Distribution implementations).
         let rand_iter: Box<dyn Iterator<Item = u8>> = match config.vals {
@@ -991,7 +1095,20 @@ impl RandBytesIter {
             config: config.clone(),
             rand_iter,
             rng: rand::thread_rng(),
+            fixed_prefix,
         }
+    }
+
+    // Produces the same fixed prefix repeatedly with no random component.
+    fn new_fixed(fixed_prefix: Bytes) -> Self {
+        Self::new(
+            &RandConfig {
+                size_min: 0,
+                size_max: 0,
+                vals: RandValueType::Binary,
+            },
+            fixed_prefix,
+        )
     }
 }
 
@@ -999,44 +1116,37 @@ impl Iterator for RandBytesIter {
     type Item = std::io::Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Figure out the next random size of the chunk.
-        let next_size = self
-            .rng
-            .gen_range(self.config.size_min..=self.config.size_max);
+        // If there is no random portion, then just copy out the fixed portion.
+        if self.config.size_max == 0 {
+            Some(Ok(self.fixed_prefix.clone()))
+        } else {
+            // Figure out the next random size of the chunk.
+            let next_size = self.fixed_prefix.len()
+                + self
+                    .rng
+                    .gen_range(self.config.size_min..=self.config.size_max);
 
-        let mut chunk_storage = BytesMut::with_capacity(next_size);
+            let mut chunk_storage = BytesMut::with_capacity(next_size);
 
-        // I was able to measure it much faster to set the length once up front and index into the buffer to write it
-        // compared to calling put_u8 repeatedly.
-        //
-        // SAFETY: `set_len` leaves an uninitialized buffer. Here we're definitely filling in the entire space with
-        // random data.
-        unsafe { chunk_storage.set_len(next_size) };
-        for i in 0..next_size {
-            chunk_storage[i] = self.rand_iter.next().unwrap();
+            // I was able to measure it much faster to set the length once up front and index into the buffer to write it
+            // compared to calling put_u8 repeatedly.
+            //
+            // SAFETY: `set_len` leaves an uninitialized buffer. Here we're definitely filling in the entire space with
+            // random data.
+            unsafe { chunk_storage.set_len(next_size) };
+
+            // Copy the fixed portion in first, if present.
+            if !self.fixed_prefix.is_empty() {
+                chunk_storage[0..self.fixed_prefix.len()].copy_from_slice(&self.fixed_prefix[..]);
+            }
+
+            // Fill the rest with random data.
+            for x in &mut chunk_storage[self.fixed_prefix.len()..next_size] {
+                *x = self.rand_iter.next().unwrap();
+            }
+
+            Some(Ok(chunk_storage.freeze()))
         }
-
-        Some(Ok(chunk_storage.freeze()))
-    }
-}
-
-// An iterator that produces the same Bytes value infinitely. I couldn't get stream::repeat() to work, so I had to write
-// this.
-struct FixedBytesIter {
-    bytes: Bytes,
-}
-
-impl FixedBytesIter {
-    fn new(bytes: Bytes) -> Self {
-        Self { bytes }
-    }
-}
-
-impl Iterator for FixedBytesIter {
-    type Item = std::io::Result<Bytes>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(Ok(self.bytes.clone()))
     }
 }
 
@@ -1081,7 +1191,11 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
         ),
         InputMode::Random => (
             setup_local_output(args),
-            local_input_driver_from_iter(RandBytesIter::new(&args.rand_config), router_sink),
+            local_input_driver_from_iter(
+                RandBytesIter::new(&args.rand_config, Bytes::new()),
+                Duration::ZERO,
+                router_sink,
+            ),
         ),
         InputMode::Fixed => (setup_local_output(args), {
             // Create a random buffer of the size requested by send_size and containing data that matches the
@@ -1092,11 +1206,30 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
                 vals: args.rand_config.vals,
             };
 
-            let fixed_buf = RandBytesIter::new(&conf).next().unwrap().unwrap();
+            let fixed_buf = RandBytesIter::new(&conf, Bytes::new())
+                .next()
+                .unwrap()
+                .unwrap();
             assert!(fixed_buf.len() == args.send_size as usize);
 
             // This will just keep sending that same fixed buffer to the router forever.
-            local_input_driver_from_iter(FixedBytesIter::new(fixed_buf), router_sink)
+            local_input_driver_from_iter(
+                RandBytesIter::new_fixed(fixed_buf),
+                Duration::ZERO,
+                router_sink,
+            )
+        }),
+        InputMode::PfQosClient => (setup_local_output(args), {
+            // The PlayFab QoS protocol requires a fixed prefix to each datagram's payload. In the response, it will
+            // invert the prefix bytes and echo the payload.
+            //
+            // Generate random payloads with the same fixed prefix.
+            let fixed_buf = Bytes::from_static(&PFQOS_FIXED_REQUEST_PREFIX);
+            local_input_driver_from_iter(
+                RandBytesIter::new(&args.rand_config, fixed_buf),
+                Duration::from_millis(args.stats_period as u64),
+                router_sink,
+            )
         }),
     }
 }
@@ -1841,7 +1974,7 @@ async fn handle_udp_sockets(
         }
     }
 
-    let mut stats_tracker = StatsTracker::new();
+    let mut stats_tracker = StatsTracker::new(args);
 
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
     loop {
@@ -1855,9 +1988,8 @@ async fn handle_udp_sockets(
                     eprintln!("Router handling traffic: {:?}", sb);
                 }
 
-                // If local IO sent an empty message, that means it was closed.
-                if sb.data.is_empty() && sb.route_id == LOCAL_IO_ROUTE_ID {
-                    // The user asked to exit the program after the input stream closed.
+                if sb.route_id == LOCAL_IO_ROUTE_ID {
+                    // If local IO sent an empty message, that means it was closed.
                     if args.should_exit_after_input_closed {
                         // Before quitting and therefore disconnecting all the sockets, give a small amount of time to
                         // allow in-flight traffic to be sent.
@@ -1913,6 +2045,10 @@ async fn handle_udp_sockets(
                             eprintln!("Error forwarding on channel to {}. {}", channel_dest_route_addr.peer, e);
                             broken_routes.insert(channel_dest);
                         } else {
+                            if args.input_mode == InputMode::PfQosClient {
+                                route_db.write().unwrap().get_latency_stats_mut(channel_dest).record_send(sb.data.clone());
+                            }
+
                             stats_tracker.record_send(&sb.data);
                         }
 
@@ -1946,6 +2082,10 @@ async fn handle_udp_sockets(
                                 eprintln!("Error forwarding to {}. {}", dest_route_addr.peer, e);
                                 broken_routes.insert(*dest_route);
                             } else {
+                                if args.input_mode == InputMode::PfQosClient {
+                                    route_db.write().unwrap().get_latency_stats_mut(*dest_route).record_send(sb.data.clone());
+                                }
+
                                 stats_tracker.record_send(&sb.data);
                             }
                         } else {
@@ -1956,7 +2096,18 @@ async fn handle_udp_sockets(
 
                 // Came from a remote endpoint, so also send to local IO.
                 if sb.route_id != LOCAL_IO_ROUTE_ID {
+                    if args.input_mode == InputMode::PfQosClient {
+                        let mut route_db_lock = route_db.write().unwrap();
+                        let latency_stats = route_db_lock.get_latency_stats_mut(sb.route_id);
+                        latency_stats.record_recv(&sb.data, args);
+                        if let Some(latest_rtt) = latency_stats.try_get_latest_rtt() {
+                            let route_addr = route_db_lock.lookup_addr(sb.route_id).clone();
+                            eprintln!("{} Round trip time: {:>5} ms", route_addr, latest_rtt.as_millis());
+                        }
+                    }
+
                     stats_tracker.record_recv(&sb.data);
+
                     if let Some(ref mut local_output_sink) = local_output_sink_opt {
                         // If we hit an error emitting output, clear out the local output sink so we don't bother
                         // trying to output more.
@@ -2045,6 +2196,10 @@ enum InputMode {
     /// Repeatedly send the same random buffer forever. The size of the buffer is controlled by --sb and the contents are controlled by --rvals. Only useful for perf testing, really
     #[value(name = "fixed", alias = "f")]
     Fixed,
+
+    /// Act as a client for PlayFab Quality of Service beacon servers, measuring round trip latency.
+    #[value(name = "pfqoscli")]
+    PfQosClient,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
@@ -2223,6 +2378,15 @@ pub struct NcArgs {
     #[arg(long = "stats")]
     should_track_stats: bool,
 
+    /// How often to send latency pings and print out throughput stats, in milliseconds.
+    #[arg(
+        long = "stats-time",
+        alias = "st",
+        value_name = "MS",
+        default_value_t = 1000
+    )]
+    stats_period: u32,
+
     /// Emit verbose logging.
     #[arg(short = 'v')]
     verbose: bool,
@@ -2293,6 +2457,10 @@ async fn async_main() -> Result<(), String> {
         _ => {}
     }
 
+    if args.input_mode == InputMode::PfQosClient && !args.is_udp {
+        usage("pfqoscli input mode requires UDP.");
+    }
+
     let mut targets: Vec<ConnectionTarget> = vec![];
 
     if !args.targets.is_empty() {
@@ -2347,9 +2515,7 @@ async fn async_main() -> Result<(), String> {
     // param for get_local_addrs tells it to automatically include the wildcard local address if no source addresses
     // were explicitly specified.
     let outbound_source_addrs = get_local_addrs(
-        args.outbound_source_host_opt
-            .iter()
-            .map(String::as_str),
+        args.outbound_source_host_opt.iter().map(String::as_str),
         true,
         &args,
     )
