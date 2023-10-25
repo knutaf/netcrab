@@ -83,6 +83,7 @@ The input mode can be controlled. By default, input comes from stdin. It accepts
 - `echo`: any received traffic will be echoed back to its sender.
 - `rand`: random data will be generated. The random sizes of data can be controlled by `--rsizemin` and `--rsizemax`, and the type of data can be controlled by `--rvals`.
 - `fixed`: only really useful for perf testing. The same fixed-size message with fixed data will be sent infinitely. You can control the size using `--ss` and the type of random data in it with `--rvals`
+- `pfqoscli`: measure latency against [PlayFab Quality of Service beacons](https://learn.microsoft.com/en-us/gaming/playfab/features/multiplayer/servers/using-qos-beacons-to-measure-player-latency-to-azure).
 
 When using one of the stdin modes as input, you can specify `--exit-after-input` to quit the program after the input stream reaches end of file.
 
