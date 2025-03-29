@@ -10,7 +10,7 @@ use futures::{
     channel::mpsc, future, future::FusedFuture, stream::FuturesUnordered, FutureExt, SinkExt,
     StreamExt,
 };
-use rand::{distributions::Distribution, Rng};
+use rand::{distr::Distribution, Rng};
 use regex::Regex;
 use std::{
     collections::HashMap,
@@ -220,8 +220,8 @@ extern crate lazy_static;
 
 lazy_static! {
     // Make a static vector with all printable ASCII characters. If we wanted to avoid a static allocation we'd need to
-    // implement a sibling of RandBytesIter that contains this vector with it, so that Slice could reference within the
-    // object.
+    // implement a sibling of RandBytesIter that contains this vector with it, so that rand::distr::slice::Choose could
+    // reference within the object.
     static ref ASCII_CHARS_STORAGE : Vec<u8> = {
         (0u8..=u8::MAX).filter(|i| {
             let c = *i as char;
@@ -1081,23 +1081,23 @@ impl RandBytesIter {
         let rand_iter: Box<dyn Iterator<Item = u8>> = match config.vals {
             RandValueType::Binary => {
                 // Use a standard distribution across all u8 values.
-                Box::new(rand::thread_rng().sample_iter(rand::distributions::Standard))
+                Box::new(rand::rng().sample_iter(rand::distr::StandardUniform))
             }
             RandValueType::Ascii => {
-                // Make a distribution that references only ASCII characters. Slice returns a reference to the element
+                // Make a distribution that references only ASCII characters. Choose returns a reference to the element
                 // in the original array, so map and dereference to return u8 instead of &u8.
-                let ascii_dist = rand::distributions::Slice::new(&ASCII_CHARS_STORAGE)
+                let ascii_dist = rand::distr::slice::Choose::new(&ASCII_CHARS_STORAGE)
                     .unwrap()
                     .map(std::clone::Clone::clone);
 
-                Box::new(rand::thread_rng().sample_iter(ascii_dist))
+                Box::new(rand::rng().sample_iter(ascii_dist))
             }
         };
 
         Self {
             config: config.clone(),
             rand_iter,
-            rng: rand::thread_rng(),
+            rng: rand::rng(),
             fixed_prefix,
         }
     }
@@ -1127,7 +1127,7 @@ impl Iterator for RandBytesIter {
             let next_size = self.fixed_prefix.len()
                 + self
                     .rng
-                    .gen_range(self.config.size_min..=self.config.size_max);
+                    .random_range(self.config.size_min..=self.config.size_max);
 
             let mut chunk_storage = BytesMut::with_capacity(next_size);
 
@@ -2309,7 +2309,6 @@ pub struct NcArgs {
     #[arg(short = 'l', value_name = "ADDR:PORT")]
     listen_once: Vec<String>,
 
-    /// Listen repeatedly for incoming connections
     /// Listen repeatedly for incoming connections. Can be specified multiple times to listen on different addresses. See notes below too.
     #[arg(short = 'L', value_name = "ADDR:PORT", conflicts_with = "listen_once")]
     listen_many: Vec<String>,

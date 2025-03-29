@@ -3,7 +3,7 @@ name = "netcrab"
 description = "A multi-purpose TCP/UDP listener and connector"
 keywords = ["tcp", "udp", "networking", "sockets"]
 categories = ["network-programming", "command-line-utilities"]
-version = "0.10.0"
+version = "0.10.1"
 authors = ["knutaf"]
 edition = "2021"
 repository = "https://github.com/knutaf/netcrab"
@@ -17,12 +17,12 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
 tokio-stream = { version = "0.1" }
-bytes = "1.0"
-clap = { version = "4.2", features = ["derive"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
 console = "0.15"
 socket2 = "0.5"
-default-net = "0.16"
-rand = "0.8"
+default-net = "0.22"
+rand = "0.9"
 lazy_static = "1.4"
 regex = "1.9"
 execute = "0.2"
