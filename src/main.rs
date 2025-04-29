@@ -10,18 +10,36 @@ use futures::{
     channel::mpsc, future, future::FusedFuture, stream::FuturesUnordered, FutureExt, SinkExt,
     StreamExt,
 };
-use rand::{distr::Distribution, Rng};
+use rand::{
+    distr::{Distribution, Uniform},
+    rngs::StdRng,
+    Rng, SeedableRng,
+};
 use regex::Regex;
 use std::{
     collections::HashMap,
     collections::HashSet,
     io::{IsTerminal, Write},
     net::SocketAddr,
+    ops::RangeInclusive,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
+
+/// This grabs a random distribution from the RNG, but bypasses the RNG if it finds that the range is only one element.
+fn get_random_duration(
+    duration_range: &RangeInclusive<Duration>,
+    distribution: &impl Distribution<Duration>,
+    rng: &mut impl Rng,
+) -> Duration {
+    if *duration_range.start() == *duration_range.end() {
+        *duration_range.start()
+    } else {
+        distribution.sample(rng)
+    }
+}
 
 // Some useful general notes about Rust async programming that might help when reading this code here.
 //
@@ -683,7 +701,9 @@ impl<'a> TcpRouter<'a> {
 
         let mut stats_tracker = StatsTracker::new(&self.args);
 
-        let receive_delay = args.get_receive_delay();
+        let delay_range = args.get_receive_delay_range();
+        let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+        let mut rng = rand::rng();
 
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
         // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
@@ -697,6 +717,7 @@ impl<'a> TcpRouter<'a> {
             futures::select! {
                 // Service all incoming traffic from all sockets.
                 sb = self.inbound_net_traffic_stream.select_next_some() => {
+                    let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
                     if receive_delay != Duration::ZERO {
                         tokio::time::sleep(receive_delay).await;
                     }
@@ -717,7 +738,7 @@ impl<'a> TcpRouter<'a> {
                             // traffic to be sent.
                             //
                             // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
-                            // sent to the network rather than a random delay, but I'm not sure how.
+                            // sent to the network rather than an arbitrary delay, but I'm not sure how.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             self.routes.clear();
                             continue;
@@ -851,22 +872,34 @@ fn map_drain_sink_err_to_io_err(_err: std::convert::Infallible) -> std::io::Erro
 // element to make sure it can flow through the rest of the system.
 fn local_input_driver_from_iter<TIter>(
     iter: TIter,
-    delay: Duration,
+    delay_range: &RangeInclusive<Duration>,
     mut router_sink: RouterSink,
 ) -> LocalInputDriver
 where
     TIter: Iterator<Item = std::io::Result<Bytes>> + 'static,
 {
+    // Can't pass a reference into the async block, so clone it for transfer.
+    let delay_range = delay_range.clone();
+
     // Transfer ownership of the iterator and router sink into the async block.
     Box::pin(
         async move {
-            let mut stream = Box::pin(futures::stream::iter(iter).then(|e| async {
-                if delay == Duration::ZERO {
-                    tokio::task::yield_now().await;
-                } else {
-                    tokio::time::sleep(delay).await;
+            // Don't want to reconstruct the distribution or the RNG on every element that gets processed, so construct
+            // these outside the closure.
+            let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+            let mut rng = rand::rng();
+
+            let mut stream = Box::pin(futures::stream::iter(iter).then(|e| {
+                let delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
+                async move {
+                    if delay == Duration::ZERO {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+
+                    e.map(SourcedBytes::create_with_local_source)
                 }
-                e.map(SourcedBytes::create_with_local_source)
             }));
 
             router_sink.send_all(&mut stream).await
@@ -943,10 +976,13 @@ where
     // mode, and if this is reading from a child program execution, that definitely can't use character mode.
     let is_interactive_mode = args.is_interactive_input_mode();
     let chunk_size = args.send_size as usize;
-    let delay = args.get_send_delay();
+    let delay_range = args.get_send_delay_range();
 
     Box::pin(
         tokio::task::spawn(async move {
+            let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+            let mut rng = StdRng::from_rng(&mut rand::rng());
+
             // Create storage for the input from stdin. It needs to be big enough to store the user's desired chunk size
             // It will accumulate data until it's filled an entire chunk, at which point it will be sent and repurposed
             // for the next chunk.
@@ -1016,7 +1052,11 @@ where
                                     &mut router_sink,
                                     chunk_size,
                                     alloc_size,
-                                    delay,
+                                    get_random_duration(
+                                        &delay_range,
+                                        &delay_distribution,
+                                        &mut rng,
+                                    ),
                                 )
                                 .await;
                                 if send_result.is_err() {
@@ -1052,7 +1092,7 @@ where
                                 &mut router_sink,
                                 chunk_size,
                                 alloc_size,
-                                delay,
+                                get_random_duration(&delay_range, &delay_distribution, &mut rng),
                             )
                             .await;
                             if send_result.is_err() {
@@ -1211,7 +1251,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             setup_local_output(args),
             local_input_driver_from_iter(
                 RandBytesIter::new(&args.rand_config, Bytes::new()),
-                args.get_send_delay(),
+                &args.get_send_delay_range(),
                 router_sink,
             ),
         ),
@@ -1233,7 +1273,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             // This will just keep sending that same fixed buffer to the router forever.
             local_input_driver_from_iter(
                 RandBytesIter::new_fixed(fixed_buf),
-                args.get_send_delay(),
+                &args.get_send_delay_range(),
                 router_sink,
             )
         }),
@@ -1245,7 +1285,8 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             let fixed_buf = Bytes::from_static(&PFQOS_FIXED_REQUEST_PREFIX);
             local_input_driver_from_iter(
                 RandBytesIter::new(&args.rand_config, fixed_buf),
-                Duration::from_millis(args.stats_period as u64),
+                &(Duration::from_millis(args.stats_period as u64)
+                    ..=Duration::from_millis(args.stats_period as u64)),
                 router_sink,
             )
         }),
@@ -1994,7 +2035,9 @@ async fn handle_udp_sockets(
 
     let mut stats_tracker = StatsTracker::new(args);
 
-    let receive_delay = args.get_receive_delay();
+    let delay_range = args.get_receive_delay_range();
+    let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+    let mut rng = rand::rng();
 
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
     loop {
@@ -2004,6 +2047,7 @@ async fn handle_udp_sockets(
                 panic!("net_to_router_flow ended! {:?}", result);
             },
             mut sb = inbound_net_traffic_stream.select_next_some() => {
+                let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
                 if receive_delay != Duration::ZERO {
                     tokio::time::sleep(receive_delay).await;
                 }
@@ -2365,23 +2409,41 @@ pub struct NcArgs {
     #[arg(long = "rb")]
     recvbuf_size_opt: Option<u32>,
 
-    /// How long to delay between sends, in milliseconds.
+    /// Minimum amount to delay between sends, in milliseconds.
     #[arg(
-        long = "sd",
-        alias = "send-delay",
+        long = "sdmin",
+        alias = "send-delay-min",
         value_name = "MS",
         default_value_t = 0
     )]
-    send_delay_ms: u64,
+    send_delay_min_ms: u64,
 
-    /// How long to delay incoming receives, in milliseconds.
+    /// Maximum amount to delay between sends, in milliseconds.
     #[arg(
-        long = "rd",
-        alias = "receive-delay",
+        long = "sdmax",
+        alias = "send-delay-max",
         value_name = "MS",
         default_value_t = 0
     )]
-    receive_delay_ms: u64,
+    send_delay_max_ms: u64,
+
+    /// Minimum amount to delay between receives, in milliseconds.
+    #[arg(
+        long = "rdmin",
+        alias = "receive-delay-min",
+        value_name = "MS",
+        default_value_t = 0
+    )]
+    receive_delay_min_ms: u64,
+
+    /// Maximum amount to delay between receives, in milliseconds.
+    #[arg(
+        long = "rdmax",
+        alias = "receive-delay-max",
+        value_name = "MS",
+        default_value_t = 0
+    )]
+    receive_delay_max_ms: u64,
 
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
@@ -2478,12 +2540,14 @@ impl NcArgs {
         }
     }
 
-    fn get_send_delay(&self) -> Duration {
-        Duration::from_millis(self.send_delay_ms)
+    fn get_send_delay_range(&self) -> RangeInclusive<Duration> {
+        Duration::from_millis(self.send_delay_min_ms)
+            ..=Duration::from_millis(self.send_delay_max_ms)
     }
 
-    fn get_receive_delay(&self) -> Duration {
-        Duration::from_millis(self.receive_delay_ms)
+    fn get_receive_delay_range(&self) -> RangeInclusive<Duration> {
+        Duration::from_millis(self.receive_delay_min_ms)
+            ..=Duration::from_millis(self.receive_delay_max_ms)
     }
 }
 
