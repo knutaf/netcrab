@@ -41,6 +41,22 @@ fn get_random_duration(
     }
 }
 
+fn create_bool_distribution(chance: f64) -> Option<rand::distr::Bernoulli> {
+    if chance == 0.0 {
+        None
+    } else {
+        Some(rand::distr::Bernoulli::new(chance).unwrap())
+    }
+}
+
+fn get_random_bool(distribution_opt: &Option<impl Distribution<bool>>, rng: &mut impl Rng) -> bool {
+    if let Some(distribution) = distribution_opt {
+        distribution.sample(rng)
+    } else {
+        false
+    }
+}
+
 // Some useful general notes about Rust async programming that might help when reading this code here.
 //
 // Many parts of the program use futures. A future is an object that contains some processing to defer eventually. It
@@ -703,6 +719,7 @@ impl<'a> TcpRouter<'a> {
 
         let delay_range = args.get_receive_delay_range();
         let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+        let drop_distribution = create_bool_distribution(args.receive_drop_chance);
         let mut rng = rand::rng();
 
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
@@ -720,6 +737,10 @@ impl<'a> TcpRouter<'a> {
                     let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
                     if receive_delay != Duration::ZERO {
                         tokio::time::sleep(receive_delay).await;
+                    }
+
+                    if get_random_bool(&drop_distribution, &mut rng) {
+                        continue;
                     }
 
                     if self.args.verbose {
@@ -873,6 +894,7 @@ fn map_drain_sink_err_to_io_err(_err: std::convert::Infallible) -> std::io::Erro
 fn local_input_driver_from_iter<TIter>(
     iter: TIter,
     delay_range: &RangeInclusive<Duration>,
+    drop_chance: f64,
     mut router_sink: RouterSink,
 ) -> LocalInputDriver
 where
@@ -887,10 +909,12 @@ where
             // Don't want to reconstruct the distribution or the RNG on every element that gets processed, so construct
             // these outside the closure.
             let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+            let drop_distribution = create_bool_distribution(drop_chance);
             let mut rng = rand::rng();
 
-            let mut stream = Box::pin(futures::stream::iter(iter).then(|e| {
+            let mut stream = Box::pin(futures::stream::iter(iter).filter_map(|e| {
                 let delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
+                let should_drop = get_random_bool(&drop_distribution, &mut rng);
                 async move {
                     if delay == Duration::ZERO {
                         tokio::task::yield_now().await;
@@ -898,7 +922,11 @@ where
                         tokio::time::sleep(delay).await;
                     }
 
-                    e.map(SourcedBytes::create_with_local_source)
+                    if should_drop {
+                        None
+                    } else {
+                        Some(e.map(SourcedBytes::create_with_local_source))
+                    }
                 }
             }));
 
@@ -941,9 +969,15 @@ where
         chunk_size: usize,
         alloc_size: usize,
         delay: Duration,
+        should_drop: bool,
     ) -> std::io::Result<()> {
         if delay != Duration::ZERO {
             tokio::time::sleep(delay).await;
+        }
+
+        // TODO knutaf correct?
+        if should_drop {
+            return Ok(());
         }
 
         router_sink
@@ -977,6 +1011,8 @@ where
     let is_interactive_mode = args.is_interactive_input_mode();
     let chunk_size = args.send_size as usize;
     let delay_range = args.get_send_delay_range();
+
+    let drop_distribution = create_bool_distribution(args.send_drop_chance);
 
     Box::pin(
         tokio::task::spawn(async move {
@@ -1057,6 +1093,7 @@ where
                                         &delay_distribution,
                                         &mut rng,
                                     ),
+                                    get_random_bool(&drop_distribution, &mut rng),
                                 )
                                 .await;
                                 if send_result.is_err() {
@@ -1093,6 +1130,7 @@ where
                                 chunk_size,
                                 alloc_size,
                                 get_random_duration(&delay_range, &delay_distribution, &mut rng),
+                                get_random_bool(&drop_distribution, &mut rng),
                             )
                             .await;
                             if send_result.is_err() {
@@ -1252,6 +1290,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             local_input_driver_from_iter(
                 RandBytesIter::new(&args.rand_config, Bytes::new()),
                 &args.get_send_delay_range(),
+                args.send_drop_chance,
                 router_sink,
             ),
         ),
@@ -1274,6 +1313,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             local_input_driver_from_iter(
                 RandBytesIter::new_fixed(fixed_buf),
                 &args.get_send_delay_range(),
+                args.send_drop_chance,
                 router_sink,
             )
         }),
@@ -1287,6 +1327,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
                 RandBytesIter::new(&args.rand_config, fixed_buf),
                 &(Duration::from_millis(args.stats_period as u64)
                     ..=Duration::from_millis(args.stats_period as u64)),
+                args.send_drop_chance,
                 router_sink,
             )
         }),
@@ -2037,6 +2078,7 @@ async fn handle_udp_sockets(
 
     let delay_range = args.get_receive_delay_range();
     let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
+    let drop_distribution = create_bool_distribution(args.receive_drop_chance);
     let mut rng = rand::rng();
 
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
@@ -2050,6 +2092,10 @@ async fn handle_udp_sockets(
                 let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
                 if receive_delay != Duration::ZERO {
                     tokio::time::sleep(receive_delay).await;
+                }
+
+                if get_random_bool(&drop_distribution, &mut rng) {
+                    continue;
                 }
 
                 if args.verbose {
@@ -2409,7 +2455,7 @@ pub struct NcArgs {
     #[arg(long = "rb")]
     recvbuf_size_opt: Option<u32>,
 
-    /// Minimum amount to delay between sends, in milliseconds.
+    /// Minimum amount to delay between local sends, in milliseconds.
     #[arg(
         long = "sdmin",
         alias = "send-delay-min",
@@ -2418,7 +2464,7 @@ pub struct NcArgs {
     )]
     send_delay_min_ms: u64,
 
-    /// Maximum amount to delay between sends, in milliseconds.
+    /// Maximum amount to delay between local sends, in milliseconds.
     #[arg(
         long = "sdmax",
         alias = "send-delay-max",
@@ -2427,7 +2473,7 @@ pub struct NcArgs {
     )]
     send_delay_max_ms: u64,
 
-    /// Minimum amount to delay between receives, in milliseconds.
+    /// Minimum amount to delay between receives/forwards, in milliseconds.
     #[arg(
         long = "rdmin",
         alias = "receive-delay-min",
@@ -2436,7 +2482,7 @@ pub struct NcArgs {
     )]
     receive_delay_min_ms: u64,
 
-    /// Maximum amount to delay between receives, in milliseconds.
+    /// Maximum amount to delay between receives/forwards, in milliseconds.
     #[arg(
         long = "rdmax",
         alias = "receive-delay-max",
@@ -2444,6 +2490,24 @@ pub struct NcArgs {
         default_value_t = 0
     )]
     receive_delay_max_ms: u64,
+
+    /// Chance to drop each local send, from [0.0, 1.0].
+    #[arg(
+        long = "sdrop",
+        alias = "send-drop-chance",
+        value_name = "MS",
+        default_value_t = 0.0
+    )]
+    send_drop_chance: f64,
+
+    /// Chance to drop each receive/forward, from [0.0, 1.0].
+    #[arg(
+        long = "rdrop",
+        alias = "receive-drop-chance",
+        value_name = "MS",
+        default_value_t = 0.0
+    )]
+    receive_drop_chance: f64,
 
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
@@ -2630,6 +2694,14 @@ async fn async_main() -> Result<(), String> {
 
     if !args.is_listening() && targets.is_empty() {
         usage("Need host:port to connect to!");
+    }
+
+    if args.send_drop_chance > 1.0 || args.send_drop_chance < 0.0 {
+        usage("Invalid send drop chance. Must be from 0.0 to 1.0.");
+    }
+
+    if args.receive_drop_chance > 1.0 || args.receive_drop_chance < 0.0 {
+        usage("Invalid receive drop chance. Must be from 0.0 to 1.0.");
     }
 
     // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
