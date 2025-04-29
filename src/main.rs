@@ -677,11 +677,13 @@ impl<'a> TcpRouter<'a> {
     }
 
     // Start asynchronously processing data from all managed sockets.
-    pub async fn service(&mut self) -> std::io::Result<()> {
+    pub async fn service(&mut self, args: &NcArgs) -> std::io::Result<()> {
         // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
         let mut local_output_sink_opt = Some(&mut self.local_output_sink);
 
         let mut stats_tracker = StatsTracker::new(&self.args);
+
+        let receive_delay = args.get_receive_delay();
 
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
         // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
@@ -695,6 +697,10 @@ impl<'a> TcpRouter<'a> {
             futures::select! {
                 // Service all incoming traffic from all sockets.
                 sb = self.inbound_net_traffic_stream.select_next_some() => {
+                    if receive_delay != Duration::ZERO {
+                        tokio::time::sleep(receive_delay).await;
+                    }
+
                     if self.args.verbose {
                         eprintln!("Router handling traffic: {:?}", sb);
                     }
@@ -901,7 +907,12 @@ where
         router_sink: &mut RouterSink,
         chunk_size: usize,
         alloc_size: usize,
+        delay: Duration,
     ) -> std::io::Result<()> {
+        if delay != Duration::ZERO {
+            tokio::time::sleep(delay).await;
+        }
+
         router_sink
             .send(SourcedBytes::create_with_local_source(
                 read_buf.split().freeze(),
@@ -932,6 +943,7 @@ where
     // mode, and if this is reading from a child program execution, that definitely can't use character mode.
     let is_interactive_mode = args.is_interactive_input_mode();
     let chunk_size = args.send_size as usize;
+    let delay = args.get_send_delay();
 
     Box::pin(
         tokio::task::spawn(async move {
@@ -1004,6 +1016,7 @@ where
                                     &mut router_sink,
                                     chunk_size,
                                     alloc_size,
+                                    delay,
                                 )
                                 .await;
                                 if send_result.is_err() {
@@ -1039,6 +1052,7 @@ where
                                 &mut router_sink,
                                 chunk_size,
                                 alloc_size,
+                                delay,
                             )
                             .await;
                             if send_result.is_err() {
@@ -1197,7 +1211,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             setup_local_output(args),
             local_input_driver_from_iter(
                 RandBytesIter::new(&args.rand_config, Bytes::new()),
-                Duration::ZERO,
+                args.get_send_delay(),
                 router_sink,
             ),
         ),
@@ -1219,7 +1233,7 @@ fn setup_local_io(args: &NcArgs, router_sink: RouterSink) -> LocalOutputSinkAndI
             // This will just keep sending that same fixed buffer to the router forever.
             local_input_driver_from_iter(
                 RandBytesIter::new_fixed(fixed_buf),
-                Duration::ZERO,
+                args.get_send_delay(),
                 router_sink,
             )
         }),
@@ -1664,7 +1678,7 @@ async fn do_tcp(
                     }
                 }
             },
-            _ = router.service().fuse() => {
+            _ = router.service(args).fuse() => {
                 panic!("Router exited early!");
             },
         };
@@ -1980,6 +1994,8 @@ async fn handle_udp_sockets(
 
     let mut stats_tracker = StatsTracker::new(args);
 
+    let receive_delay = args.get_receive_delay();
+
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
     loop {
         futures::select! {
@@ -1988,6 +2004,10 @@ async fn handle_udp_sockets(
                 panic!("net_to_router_flow ended! {:?}", result);
             },
             mut sb = inbound_net_traffic_stream.select_next_some() => {
+                if receive_delay != Duration::ZERO {
+                    tokio::time::sleep(receive_delay).await;
+                }
+
                 if args.verbose {
                     eprintln!("Router handling traffic: {:?}", sb);
                 }
@@ -2345,6 +2365,24 @@ pub struct NcArgs {
     #[arg(long = "rb")]
     recvbuf_size_opt: Option<u32>,
 
+    /// How long to delay between sends, in milliseconds.
+    #[arg(
+        long = "sd",
+        alias = "send-delay",
+        value_name = "MS",
+        default_value_t = 0
+    )]
+    send_delay_ms: u64,
+
+    /// How long to delay incoming receives, in milliseconds.
+    #[arg(
+        long = "rd",
+        alias = "receive-delay",
+        value_name = "MS",
+        default_value_t = 0
+    )]
+    receive_delay_ms: u64,
+
     /// Zero-IO mode. Only test for connection (TCP only)
     #[arg(short = 'z', conflicts_with = "is_udp")]
     is_zero_io: bool,
@@ -2438,6 +2476,14 @@ impl NcArgs {
             InputMode::Stdin => std::io::stdin().is_terminal(),
             _ => false,
         }
+    }
+
+    fn get_send_delay(&self) -> Duration {
+        Duration::from_millis(self.send_delay_ms)
+    }
+
+    fn get_receive_delay(&self) -> Duration {
+        Duration::from_millis(self.receive_delay_ms)
     }
 }
 
