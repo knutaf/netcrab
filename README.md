@@ -119,6 +119,7 @@ When making an outbound TCP connection or sending UDP datagrams, by default Netc
 ## Connecting to multiple outbound targets
 
 `netcrab HOST1:PORT1 HOST2:PORT2`
+
 `netcrab SOURCE_HOST1:SOURCE_PORT1=HOST1:PORT1 SOURCE_PORT2:SOURCE_HOST2=HOST2:PORT2`
 
 Netcrab allows connecting to more than one remote peer at the same time. Similarly to listening for multiple concurrent connections, traffic from the local machine will be sent to all connected peers, inbound or outbound. You can use the `=` syntax to optionally supply a different source address for each target.
@@ -197,6 +198,7 @@ Netcrab can apply a random delay within your specified range to all received mes
 ## Randomized drop chance
 
 `netcrab --sdrop PROB`
+
 `netcrab --rdrop PROB`
 
 Netcrab can drop a proportion of sends or receives/forwards, in the range of [0.0, 1.0], where 0.0 drops no sends/receives/forwards and 1.0 drops all of them. As with the equivalent delay settings, `--sdrop` controls local input and `-i` sends, and `--rdrop` controls receives and forwards due to `-f` modes. These can also be combined with the send/receive/forwarding delays.
