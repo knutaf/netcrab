@@ -112,15 +112,16 @@ You can restrict to using only IPv6 or IPv4 address families. This makes more of
 
 ## Controlling source address for outbound connections
 
-`netcrab -s ADDR:PORT`
+`netcrab SOURCE_ADDR:PORT=DEST_ADDR:PORT`
 
-When making an outbound TCP connection or sending UDP datagrams, by default Netcrab binds to the wildcard IPv4 and IPv6 addresses (0.0.0.0:0 and [::]:0). You can pass `-s` to explicitly bind to an address instead. This supports all the `ADDR:PORT` variants described in the "TCP Server" section.
+When making an outbound TCP connection or sending UDP datagrams, by default Netcrab binds to the wildcard IPv4 and IPv6 addresses (0.0.0.0:0 and [::]:0). You can the `=` syntax like above to explicitly bind to an address instead. This supports all the `ADDR:PORT` variants described in the "TCP Server" section.
 
 ## Connecting to multiple outbound targets
 
 `netcrab HOST1:PORT1 HOST2:PORT2`
+`netcrab SOURCE_HOST1:SOURCE_PORT1=HOST1:PORT1 SOURCE_PORT2:SOURCE_HOST2=HOST2:PORT2`
 
-Netcrab allows connecting to more than one remote peer at the same time. Similarly to listening for multiple concurrent connections, traffic from the local machine will be sent to all connected peers, inbound or outbound.
+Netcrab allows connecting to more than one remote peer at the same time. Similarly to listening for multiple concurrent connections, traffic from the local machine will be sent to all connected peers, inbound or outbound. You can use the `=` syntax to optionally supply a different source address for each target.
 
 ## Listening and connecting at the same time
 
@@ -180,6 +181,27 @@ As in channels mode, when in hub mode, max clients is automatically bumped to 10
 Netcrab can execute another program and connect up its stdin and stdout to the network. Could easily use it to expose a remote shell or something, though of course you'll want to be careful with that. In this mode, the regular input and output will be disabled.
 
 The command string is run through the current shell.
+
+## Send delays
+
+`netcrab --sdmin MS --sdmax MS`
+
+Netcrab can apply a random delay within your specified range to all local input before it's sent out. This affects input from the terminal as well as the other `-i` arguments. It does not affect sends resulting from forwarding messages with `-f`. That is handled by receive delays.
+
+## Receive/forwarding delays
+
+`netcrab --rdmin MS --rdmax MS`
+
+Netcrab can apply a random delay within your specified range to all received messages or messages that are being forwarded due to a forwarding mode specified by `-f`.
+
+## Randomized drop chance
+
+`netcrab --sdrop PROB`
+`netcrab --rdrop PROB`
+
+Netcrab can drop a proportion of sends or receives/forwards, in the range of [0.0, 1.0], where 0.0 drops no sends/receives/forwards and 1.0 drops all of them. As with the equivalent delay settings, `--sdrop` controls local input and `-i` sends, and `--rdrop` controls receives and forwards due to `-f` modes. These can also be combined with the send/receive/forwarding delays.
+
+Although there are no restrictions on using this, it may not make sense to use with TCP mode.
 
 ## Endless possibilities
 
