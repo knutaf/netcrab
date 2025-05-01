@@ -175,27 +175,82 @@ type RouterSink = futures::sink::SinkMapErr<
 // original argument value is stored as well as all the addresses that the name resolved to.
 #[derive(Debug, Clone)]
 struct ConnectionTarget {
-    addr_string: String,
+    dest_addr_string: String,
 
-    // This is stored as a vector instead of a SockAddrSet because we want to preserve the ordering from DNS.
-    addrs: Vec<SocketAddr>,
+    // These are stored as vectors instead of a SockAddrSet because we want to preserve the ordering from DNS.
+    dest_addrs: Vec<SocketAddr>,
+    source_addrs: Vec<SocketAddr>,
 }
 
 impl ConnectionTarget {
-    // Do a DNS resolution on an address string and make a ConnectionTarget that contains the original value and the
-    // resolved addresses.
-    async fn new(addr_string: &str) -> std::io::Result<Self> {
+    /// Do a DNS resolution on an address string and make a ConnectionTarget that contains the original destination
+    /// address, the resolved destination addresses, and any matching source addresses.
+    async fn new(
+        addr_string: &str,
+        source_addrs: &[SocketAddr],
+        args: &NcArgs,
+    ) -> std::io::Result<Self> {
+        let mut has_v4 = false;
+        let mut has_v6 = false;
+
+        // Look up all the addresses for hostname. Filter out any addresses with families incompatible to the user's
+        // preference. Track whether any v4 or v6 addresses are found, for later filtering of source addresses.
+        let dest_addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr_string)
+            .await?
+            .filter(|addr| {
+                !(args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4())
+            })
+            .inspect(|addr| {
+                if addr.is_ipv4() {
+                    has_v4 = true;
+                }
+
+                if addr.is_ipv6() {
+                    has_v6 = true;
+                }
+            })
+            .collect();
+
+        // lookup_host would have failed if it found 0 addresses, so we must have at least one.
+        assert!(has_v4 || has_v6);
+        assert!(!dest_addrs.is_empty());
+
+        // Filter source addresses to only ones that could possibly match a destination address.
+        let source_addrs: Vec<SocketAddr> = source_addrs
+            .iter()
+            .filter_map(|addr| {
+                if has_v4 && addr.is_ipv4() || has_v6 && addr.is_ipv6() {
+                    Some(addr.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if source_addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "No suitable local address for target.",
+            ));
+        }
+
         Ok(Self {
-            addr_string: String::from(addr_string),
-            addrs: tokio::net::lookup_host(&addr_string).await?.collect(),
+            dest_addr_string: String::from(addr_string),
+            dest_addrs,
+            source_addrs,
         })
     }
 }
 
 impl std::fmt::Display for ConnectionTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", &self.addr_string)?;
-        for addr in self.addrs.iter() {
+        writeln!(f, "{}", &self.dest_addr_string)?;
+        for addr in self.dest_addrs.iter() {
+            writeln!(f, "    {}", addr)?;
+        }
+
+        writeln!(f, "From:")?;
+        for addr in self.source_addrs.iter() {
             writeln!(f, "    {}", addr)?;
         }
 
@@ -264,6 +319,8 @@ lazy_static! {
     };
 
     static ref TARGET_MULTIPLIER_REGEX : Regex = Regex::new(r"x(\d+)$").expect("failed to compile regex");
+
+    static ref TARGET_SOURCE_ADDR_REGEX : Regex = Regex::new(r"^([^=]+)=([^=]+)$").expect("failed to compile regex");
 
     static ref WILDCARD_HOST_REGEX : Regex = Regex::new(r"^\*(?::(\d+))?$").expect("failed to compile regex");
 }
@@ -515,8 +572,11 @@ impl ChannelMap {
             }
 
             eprintln!(
-                "Creating channel between {} and {}",
-                known_route_addr, new_route_addr
+                "Creating channel {} <-> ({} <-> {}) <-> {}",
+                known_route_addr.peer,
+                known_route_addr.local,
+                new_route_addr.local,
+                new_route_addr.peer,
             );
 
             // Add the channel in both "directions" so it's easy to look up when routing traffic from either remote
@@ -575,8 +635,9 @@ struct TcpRouter<'a> {
     // A future that drives the local input to completion.
     local_input_driver: LocalInputDriver,
 
-    // A sink where the router can send data to be printed out.
-    local_output_sink: LocalOutputSink,
+    // A sink where the router can send data to be printed out. If the local output (i.e. stdout) fails, we can set this
+    // to None to save perf on sending to it further.
+    local_output_sink_opt: Option<LocalOutputSink>,
 
     // Used to figure out when to hook up the local input.
     lifetime_client_count: u32,
@@ -602,9 +663,9 @@ impl<'a> TcpRouter<'a> {
             router_sink,
             inbound_net_traffic_stream,
             local_input_driver: Box::pin(futures::future::pending()),
-            local_output_sink: Box::pin(
+            local_output_sink_opt: Some(Box::pin(
                 futures::sink::drain().sink_map_err(map_drain_sink_err_to_io_err),
-            ),
+            )),
             lifetime_client_count: 0,
             is_done: false,
         }
@@ -639,8 +700,10 @@ impl<'a> TcpRouter<'a> {
         // out of, say, a redirected input stream, and forward it to nobody, because there are no other clients.
         self.lifetime_client_count += 1;
         if self.lifetime_client_count == 1 {
-            (self.local_output_sink, self.local_input_driver) =
-                setup_local_io(self.args, self.router_sink.clone());
+            (
+                *self.local_output_sink_opt.as_mut().unwrap(),
+                self.local_input_driver,
+            ) = setup_local_io(self.args, self.router_sink.clone());
         }
 
         // The input end of the router (`router_sink`) can be cloned to allow multiple callers to pass data into the
@@ -712,15 +775,14 @@ impl<'a> TcpRouter<'a> {
 
     // Start asynchronously processing data from all managed sockets.
     pub async fn service(&mut self, args: &NcArgs) -> std::io::Result<()> {
-        // If the local output (i.e. stdout) fails, we can set this to None to save perf on sending to it further.
-        let mut local_output_sink_opt = Some(&mut self.local_output_sink);
-
         let mut stats_tracker = StatsTracker::new(&self.args);
 
         let delay_range = args.get_receive_delay_range();
         let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
         let drop_distribution = create_bool_distribution(args.receive_drop_chance);
         let mut rng = rand::rng();
+
+        let mut delayed_receives = futures::stream::FuturesOrdered::new();
 
         // This is servicing more than one type of event. Whenever one event type completes, after we handle it, loop
         // back and continue processing the rest of them. While one event is being serviced, the other ones are canceled
@@ -734,123 +796,30 @@ impl<'a> TcpRouter<'a> {
             futures::select! {
                 // Service all incoming traffic from all sockets.
                 sb = self.inbound_net_traffic_stream.select_next_some() => {
-                    let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
-                    if receive_delay != Duration::ZERO {
-                        tokio::time::sleep(receive_delay).await;
-                    }
-
+                    // Drop this receive if the die roll says to. This is TCP, so kind of use at your own peril.
                     if get_random_bool(&drop_distribution, &mut rng) {
                         continue;
                     }
 
-                    if self.args.verbose {
-                        eprintln!("Router handling traffic: {:?}", sb);
-                    }
-
-                    // If local IO sent an empty message, that means it was closed.
-                    if sb.data.is_empty() && sb.route_id == LOCAL_IO_ROUTE_ID {
-                        // The user asked to exit the program after the input stream closed. Clear all the routes, which
-                        // will cause graceful disconnections on all of them. Mark the router as done so the caller can
-                        // know not to do further work.
-                        if self.args.should_exit_after_input_closed {
-                            self.is_done = true;
-
-                            // Before disconnecting all the sockets, give a small amount of time to allow in-flight
-                            // traffic to be sent.
-                            //
-                            // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
-                            // sent to the network rather than an arbitrary delay, but I'm not sure how.
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            self.routes.clear();
+                    // If a delay should be added to this receive, essentially re-queue it for processing after the
+                    // required delay. But if there was no delay, skip going to the queue and service it immediately.
+                    let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
+                    if receive_delay != Duration::ZERO {
+                        delayed_receives.push_back(async move {
+                            tokio::time::sleep(receive_delay).await;
+                            sb
+                        });
+                    } else {
+                        if self.handle_receive(sb, &mut stats_tracker).await {
                             continue;
                         }
                     }
 
-                    let mut broken_routes = RouteIdSet::new();
-                    let mut did_send = false;
-                    if self.args.is_using_channels() && sb.route_id != LOCAL_IO_ROUTE_ID {
-                        // Look up whether this incoming route has a corresponding destination route in a channel.
-                        if let Some(channel_dest) = self.channels.get_dest_route(sb.route_id) {
-                            if self.args.verbose {
-                                eprintln!("Forwarding on channel {} -> {}", self.route_db.lookup_addr(sb.route_id), channel_dest);
-                            }
-
-                            // Look up the sink to send to for this route. There always is one, so `unwrap` is OK.
-                            let dest_sink = self.routes.get_mut(&channel_dest).unwrap();
-
-                            if let Err(e) = dest_sink.send(sb.data.clone()).await {
-                                eprintln!("Error forwarding on channel to {}. {}", self.route_db.lookup_addr(channel_dest), e);
-                                broken_routes.insert(channel_dest);
-                            } else {
-                                stats_tracker.record_send(&sb.data);
-                            }
-
-                            did_send = true;
-                        } else {
-                            if self.args.verbose {
-                                eprintln!("Dropping message from {}. No channel found.", self.route_db.lookup_addr(sb.route_id));
-                            }
-                        }
-                    }
-
-                    // If no send happened from channels earlier, try again with regular routing. We shouldn't be in
-                    // both hub mode and channel mode, so mostly this covers making sure local input can be sent out,
-                    // since it isn't associated with any channel.
-                    if !did_send {
-                        // Broadcast any incoming data back to whichever other connected sockets and/or local IO it
-                        // should go to. Track any failed sends so they can be pruned from the list of known routes
-                        // after.
-                        for (dest_route, dest_sink) in self.routes.iter_mut() {
-                            if !should_forward_to(self.args, sb.route_id, *dest_route) {
-                                continue;
-                            }
-
-                            if self.args.verbose {
-                                eprintln!("Forwarding {}", self.route_db.lookup_addr(*dest_route));
-                            }
-
-                            // It could be possible to omit the peer address for the TcpRouter, because the peer address
-                            // is implicit with the socket, but I'm going to keep it this way for symmetry for now,
-                            // until it becomes a perf problem.
-                            if let Err(e) = dest_sink.send(sb.data.clone()).await {
-                                eprintln!("Error forwarding to {}. {}", self.route_db.lookup_addr(*dest_route), e);
-                                broken_routes.insert(*dest_route);
-                            } else {
-                                stats_tracker.record_send(&sb.data);
-                            }
-                        }
-                    }
-
-                    // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
-                    if sb.route_id != LOCAL_IO_ROUTE_ID {
-                        stats_tracker.record_recv(&sb.data);
-                        if let Some(ref mut local_output_sink) = local_output_sink_opt {
-                            // If we hit an error emitting output, clear out the local output sink so we don't bother
-                            // trying to output more.
-                            if let Err(e) = local_output_sink.send(sb.data.clone()).await {
-                                eprintln!("Local output closed. {}", e);
-                                local_output_sink_opt = None;
-                            }
-                        }
-                    }
-
-                    // If there were any failed sends, clear them out so we don't try to send to them in the future,
-                    // which would just result in more errors.
-                    if !broken_routes.is_empty() {
-                        for route in broken_routes.iter() {
-                            Self::cleanup_route(*route, self.args, &mut self.route_db, &mut self.routes, &mut self.channels);
-                        }
-                    }
-
-                    // Output throughput stats periodically if requested by the user.
-                    if self.args.should_track_stats {
-                        if let Some(stats) = stats_tracker.try_consume_stats() {
-                            eprintln!("recv {:>12} B/s ({:>7} recvs/s), send {:>12} B/s ({:>7} sends/s)",
-                                stats.recv_byte_count,
-                                stats.recv_count,
-                                stats.send_byte_count,
-                                stats.send_count);
-                        }
+                },
+                // Handle any re-queued receives due to induced delays.
+                sb = delayed_receives.select_next_some() => {
+                    if self.handle_receive(sb, &mut stats_tracker).await {
+                        continue;
                     }
                 },
 
@@ -865,6 +834,143 @@ impl<'a> TcpRouter<'a> {
                 },
             }
         }
+    }
+
+    async fn handle_receive(&mut self, sb: SourcedBytes, stats_tracker: &mut StatsTracker) -> bool {
+        if self.args.verbose {
+            eprintln!("Router handling traffic: {:?}", sb);
+        }
+
+        // If local IO sent an empty message, that means it was closed.
+        if sb.data.is_empty() && sb.route_id == LOCAL_IO_ROUTE_ID {
+            // The user asked to exit the program after the input stream closed. Clear all the routes, which
+            // will cause graceful disconnections on all of them. Mark the router as done so the caller can
+            // know not to do further work.
+            if self.args.should_exit_after_input_closed {
+                self.is_done = true;
+
+                // Before disconnecting all the sockets, give a small amount of time to allow in-flight
+                // traffic to be sent.
+                //
+                // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
+                // sent to the network rather than an arbitrary delay, but I'm not sure how.
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                self.routes.clear();
+                return true;
+            }
+        }
+
+        let mut broken_routes = RouteIdSet::new();
+        let mut did_send = false;
+        if self.args.is_using_channels() && sb.route_id != LOCAL_IO_ROUTE_ID {
+            // Look up whether this incoming route has a corresponding destination route in a channel.
+            if let Some(channel_dest) = self.channels.get_dest_route(sb.route_id) {
+                if self.args.verbose {
+                    eprintln!(
+                        "Forwarding on channel {} -> {}",
+                        self.route_db.lookup_addr(sb.route_id),
+                        channel_dest
+                    );
+                }
+
+                // Look up the sink to send to for this route. There always is one, so `unwrap` is OK.
+                let dest_sink = self.routes.get_mut(&channel_dest).unwrap();
+
+                if let Err(e) = dest_sink.send(sb.data.clone()).await {
+                    eprintln!(
+                        "Error forwarding on channel to {}. {}",
+                        self.route_db.lookup_addr(channel_dest),
+                        e
+                    );
+                    broken_routes.insert(channel_dest);
+                } else {
+                    stats_tracker.record_send(&sb.data);
+                }
+
+                did_send = true;
+            } else {
+                if self.args.verbose {
+                    eprintln!(
+                        "Dropping message from {}. No channel found.",
+                        self.route_db.lookup_addr(sb.route_id)
+                    );
+                }
+            }
+        }
+
+        // If no send happened from channels earlier, try again with regular routing. We shouldn't be in
+        // both hub mode and channel mode, so mostly this covers making sure local input can be sent out,
+        // since it isn't associated with any channel.
+        if !did_send {
+            // Broadcast any incoming data back to whichever other connected sockets and/or local IO it
+            // should go to. Track any failed sends so they can be pruned from the list of known routes
+            // after.
+            for (dest_route, dest_sink) in self.routes.iter_mut() {
+                if !should_forward_to(self.args, sb.route_id, *dest_route) {
+                    continue;
+                }
+
+                if self.args.verbose {
+                    eprintln!("Forwarding {}", self.route_db.lookup_addr(*dest_route));
+                }
+
+                // It could be possible to omit the peer address for the TcpRouter, because the peer address
+                // is implicit with the socket, but I'm going to keep it this way for symmetry for now,
+                // until it becomes a perf problem.
+                if let Err(e) = dest_sink.send(sb.data.clone()).await {
+                    eprintln!(
+                        "Error forwarding to {}. {}",
+                        self.route_db.lookup_addr(*dest_route),
+                        e
+                    );
+                    broken_routes.insert(*dest_route);
+                } else {
+                    stats_tracker.record_send(&sb.data);
+                }
+            }
+        }
+
+        // Came from a remote endpoint, so also send to local output if it hasn't failed yet.
+        if sb.route_id != LOCAL_IO_ROUTE_ID {
+            stats_tracker.record_recv(&sb.data);
+            if let Some(ref mut local_output_sink) = self.local_output_sink_opt {
+                // If we hit an error emitting output, clear out the local output sink so we don't bother
+                // trying to output more.
+                if let Err(e) = local_output_sink.send(sb.data.clone()).await {
+                    eprintln!("Local output closed. {}", e);
+                    self.local_output_sink_opt = None;
+                }
+            }
+        }
+
+        // If there were any failed sends, clear them out so we don't try to send to them in the future,
+        // which would just result in more errors.
+        if !broken_routes.is_empty() {
+            for route in broken_routes.iter() {
+                Self::cleanup_route(
+                    *route,
+                    self.args,
+                    &mut self.route_db,
+                    &mut self.routes,
+                    &mut self.channels,
+                );
+            }
+        }
+
+        // Output throughput stats periodically if requested by the user.
+        if self.args.should_track_stats {
+            if let Some(stats) = stats_tracker.try_consume_stats() {
+                eprintln!(
+                    "recv {:>12} B/s ({:>7} recvs/s), send {:>12} B/s ({:>7} sends/s)",
+                    stats.recv_byte_count,
+                    stats.recv_count,
+                    stats.send_byte_count,
+                    stats.send_count
+                );
+            }
+        }
+
+        false
     }
 }
 
@@ -975,7 +1081,6 @@ where
             tokio::time::sleep(delay).await;
         }
 
-        // TODO knutaf correct?
         if should_drop {
             return Ok(());
         }
@@ -1459,7 +1564,7 @@ where
 
 async fn tcp_connect_to_candidate(
     addr: &SocketAddr,
-    source_addrs: &SockAddrSet,
+    source_addrs: &[SocketAddr],
     args: &NcArgs,
 ) -> std::io::Result<tokio::net::TcpStream> {
     // Bind the local socket to any local address that matches the address family of the destination.
@@ -1501,10 +1606,22 @@ async fn get_local_addrs(
     local_addr_strings: impl Iterator<Item = &str>,
     include_unspec_as_default: bool,
     args: &NcArgs,
-) -> std::io::Result<SockAddrSet> {
+) -> std::io::Result<Vec<SocketAddr>> {
     assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
 
-    let mut local_addrs = SockAddrSet::new();
+    let mut local_addrs = Vec::new();
+
+    let mut append_addr = |addr: SocketAddr| {
+        if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
+            return;
+        }
+
+        if local_addrs.iter().any(|e| *e == addr) {
+            return;
+        }
+
+        local_addrs.push(addr);
+    };
 
     let mut did_lookup = false;
     for addr_string in local_addr_strings {
@@ -1524,12 +1641,12 @@ async fn get_local_addrs(
                 0
             };
 
-            local_addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
+            append_addr(SocketAddr::V4(std::net::SocketAddrV4::new(
                 std::net::Ipv4Addr::UNSPECIFIED,
                 port_num,
             )));
 
-            local_addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
+            append_addr(SocketAddr::V6(std::net::SocketAddrV6::new(
                 std::net::Ipv6Addr::UNSPECIFIED,
                 port_num,
                 0,
@@ -1542,7 +1659,7 @@ async fn get_local_addrs(
                     eprintln!("Resolved to {}", addr);
                 }
 
-                local_addrs.insert(*addr);
+                append_addr(*addr);
             }
         }
     }
@@ -1550,12 +1667,12 @@ async fn get_local_addrs(
     // The caller may optionally choose to default to including the wildcard local addresses if they didn't pass any
     // specific one.
     if !did_lookup && include_unspec_as_default {
-        local_addrs.insert(SocketAddr::V4(std::net::SocketAddrV4::new(
+        append_addr(SocketAddr::V4(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::UNSPECIFIED,
             0,
         )));
 
-        local_addrs.insert(SocketAddr::V6(std::net::SocketAddrV6::new(
+        append_addr(SocketAddr::V6(std::net::SocketAddrV6::new(
             std::net::Ipv6Addr::UNSPECIFIED,
             0,
             0,
@@ -1563,18 +1680,11 @@ async fn get_local_addrs(
         )));
     }
 
-    // If the caller specified only one address family, filter out any incompatible address families.
-    let local_addrs = local_addrs
-        .drain()
-        .filter(|e| !(args.af_limit.use_v4 && e.is_ipv6() || args.af_limit.use_v6 && e.is_ipv4()))
-        .collect();
-
     Ok(local_addrs)
 }
 
 async fn do_tcp(
-    listen_addrs: &SockAddrSet,
-    outbound_source_addrs: &SockAddrSet,
+    listen_addrs: &[SocketAddr],
     targets: &[ConnectionTarget],
     args: &NcArgs,
 ) -> std::io::Result<()> {
@@ -1590,13 +1700,8 @@ async fn do_tcp(
     // traffic to the same host.
     for target in targets.iter() {
         let mut succeeded_any_connection = false;
-        for addr in target.addrs.iter() {
-            // Skip incompatible candidates from what address family the user specified.
-            if args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4() {
-                continue;
-            }
-
-            match tcp_connect_to_candidate(addr, outbound_source_addrs, args).await {
+        for addr in target.dest_addrs.iter() {
+            match tcp_connect_to_candidate(addr, &target.source_addrs, args).await {
                 Ok(tcp_stream) => {
                     // If we were able to connect to a candidate, add them to the router so they can send and receive
                     // traffic.
@@ -1619,7 +1724,7 @@ async fn do_tcp(
         if !succeeded_any_connection {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
-                format!("Failed to connect to {}", &target.addr_string),
+                format!("Failed to connect to {}", &target.dest_addr_string),
             ));
         }
     }
@@ -1741,7 +1846,11 @@ async fn do_tcp(
                     // When reconnecting, just do another connection and add it to the list of ongoing connections
                     // being tracked.
                     if should_reconnect {
-                        match tcp_connect_to_candidate(&route_addr.peer, outbound_source_addrs, args).await {
+                        let Some(target) = targets.iter().find(|target| target.dest_addrs.iter().any(|addr| route_addr.peer == *addr)) else {
+                            panic!("Failed to find a target for {} that we had previously connected to", route_addr.peer);
+                        };
+
+                        match tcp_connect_to_candidate(&route_addr.peer, &target.source_addrs, args).await {
                             Ok(tcp_stream) => {
                                 // If we were able to connect to a candidate, add them to the router so they can
                                 // send and receive traffic.
@@ -1754,7 +1863,7 @@ async fn do_tcp(
                                 ));
                             }
                             Err(e) => {
-                                eprintln!("Failed to connect to {}. Error: {}", route_addr.peer, e);
+                                eprintln!("Failed to reconnect to {}. Error: {}", route_addr.peer, e);
                             }
                         }
                     }
@@ -1812,72 +1921,100 @@ async fn handle_tcp_stream(
 }
 
 async fn bind_udp_sockets(
-    listen_addrs: &SockAddrSet,
+    bind_addrs: &SockAddrSet,
+    candidates: &mut RouteAddrSet,
     args: &NcArgs,
 ) -> std::io::Result<Vec<Arc<tokio::net::UdpSocket>>> {
-    // Map the listening addresses to a set of sockets, and bind them.
-    let mut listening_sockets = vec![];
-    for listen_addr in listen_addrs.iter() {
-        let socket = tokio::net::UdpSocket::bind(*listen_addr).await?;
-        configure_socket_options(&socket, listen_addr.is_ipv4(), args)?;
+    // Map the local addresses to a set of sockets, and bind them.
+    let mut sockets = vec![];
+    for bind_addr in bind_addrs.iter() {
+        let socket = tokio::net::UdpSocket::bind(*bind_addr).await?;
+        configure_socket_options(&socket, bind_addr.is_ipv4(), args)?;
 
-        listening_sockets.push(Arc::new(socket));
+        let actual_local_addr = socket.local_addr().unwrap();
 
-        eprintln!(
-            "Bound UDP socket to {}, family {}",
-            listen_addr,
-            if listen_addr.is_ipv4() {
-                "IPv4"
-            } else {
-                "IPv6"
-            }
-        );
+        // Binding can change the bound address to be a different actual address, typically in the case where the
+        // wildcard port 0 is used. Now that the actual address is known, update any routes that were referencing the
+        // original address to have it.
+        let mut matching_candidates: Vec<RouteAddr> = candidates
+            .extract_if(|route| route.local == *bind_addr)
+            .collect();
+        for mut route in matching_candidates.drain(..) {
+            route.local = actual_local_addr.clone();
+            let was_inserted = candidates.insert(route);
+            assert!(was_inserted);
+        }
+
+        sockets.push(Arc::new(socket));
+
+        if *bind_addr == actual_local_addr {
+            eprintln!(
+                "Bound UDP address {}, family {}",
+                bind_addr,
+                if bind_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            );
+        } else {
+            eprintln!(
+                "Bound UDP address {} to {}, family {}",
+                bind_addr,
+                actual_local_addr,
+                if bind_addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            );
+        }
     }
 
-    if listening_sockets.is_empty() {
+    if sockets.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
             "Could not bind any socket.",
         ));
     }
 
-    Ok(listening_sockets)
+    Ok(sockets)
 }
 
 async fn do_udp(
-    listen_addrs: &SockAddrSet,
-    outbound_source_addrs: &SockAddrSet,
+    listen_addrs: &[SocketAddr],
     targets: &[ConnectionTarget],
     args: &NcArgs,
 ) -> std::io::Result<()> {
-    assert!(!args.af_limit.use_v4 || !args.af_limit.use_v6);
-
-    let is_compatible_af = |addr: &&SocketAddr| {
-        !(args.af_limit.use_v4 && addr.is_ipv6() || args.af_limit.use_v6 && addr.is_ipv4())
-    };
-
-    // Take the first address with a compatible address family to the user's preferences and track which address family
-    // is used, so we can find out which local sockets need to be bound.
-    let mut has_ipv4 = false;
-    let mut has_ipv6 = false;
+    let mut bind_addrs = SockAddrSet::new();
+    let mut candidates = RouteAddrSet::new();
     for target in targets.iter() {
-        if let Some(addr) = target.addrs.iter().filter(is_compatible_af).next() {
-            has_ipv4 |= addr.is_ipv4();
-            has_ipv6 |= addr.is_ipv6();
+        // Select only one address for each target to use, so we don't send duplicate traffic to two addresses from the
+        // same machine. Pick the first one of the list, because DNS may have ordered the list that way for load
+        // balancing purposes.
+        for candidate in target.dest_addrs.iter() {
+            assert!(candidate.is_ipv4() || candidate.is_ipv6());
+
+            if let Some(local_addr) = target.source_addrs.iter().find(|addr| {
+                assert!(addr.is_ipv4() || addr.is_ipv6());
+                addr.is_ipv4() == candidate.is_ipv4()
+            }) {
+                candidates.insert(RouteAddr {
+                    local: local_addr.clone(),
+                    peer: candidate.clone(),
+                });
+
+                bind_addrs.insert(local_addr.clone());
+
+                // Move on to the next target after the first successful route for this one is found.
+                break;
+            } else {
+                eprintln!(
+                    "No matching local address found for destination address {}.",
+                    candidate
+                );
+            }
         }
     }
 
-    // Filter the source address list to only ones that match the address families of any candidates being used.
-    let mut bind_addrs: SockAddrSet = outbound_source_addrs
-        .iter()
-        .filter_map(|e| {
-            if (e.is_ipv4() && has_ipv4) || (e.is_ipv6() && has_ipv6) {
-                Some(*e)
-            } else {
-                None
-            }
-        })
-        .collect();
+    if listen_addrs.is_empty() && candidates.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "No suitable remote peers found.",
+        ));
+    }
 
     // To get the whole list of addresses to bind to, add in all the ones the user specified to listen on.
     bind_addrs.extend(listen_addrs.iter());
@@ -1890,40 +2027,9 @@ async fn do_udp(
     }
 
     // Bind to all the source addresses that are needed.
-    let sockets = bind_udp_sockets(&bind_addrs, args).await?;
+    let sockets = bind_udp_sockets(&bind_addrs, &mut candidates, args).await?;
 
     assert!(!sockets.is_empty());
-
-    let mut candidates = RouteAddrSet::new();
-    for target in targets.iter() {
-        // Select only one address for each target to use, so we don't send duplicate traffic to two addresses from the
-        // same machine. Pick the first one of the list, because that might be the preferred choice for DNS load
-        // balancing.
-        if let Some(candidate) = target.addrs.iter().filter(is_compatible_af).next() {
-            for socket in sockets.iter() {
-                let route = RouteAddr {
-                    local: socket.local_addr().unwrap(),
-                    peer: *candidate,
-                };
-                if route.local.is_ipv4() != route.peer.is_ipv4() {
-                    // Skip because incompatible address family.
-                    continue;
-                }
-
-                candidates.insert(route);
-
-                // Choose the first socket with a matching address family to use to send to the peer.
-                break;
-            }
-        }
-    }
-
-    if listen_addrs.is_empty() && candidates.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "No suitable remote peers found.",
-        ));
-    }
 
     // If joining multicast, then try to have each source address join each multicast group of a matching address
     // family.
@@ -1934,6 +2040,10 @@ async fn do_udp(
                 .iter()
                 .filter(|c| c.local.is_ipv4() == local_addr.is_ipv4())
             {
+                eprintln!(
+                    "Joining multicast group {} <-> {}",
+                    local_addr, candidate.peer
+                );
                 join_multicast_group(&**socket, &local_addr, &candidate.peer)?;
             }
         }
@@ -2079,6 +2189,249 @@ async fn handle_udp_sockets(
     let delay_range = args.get_receive_delay_range();
     let delay_distribution = Uniform::try_from(delay_range.clone()).unwrap();
     let drop_distribution = create_bool_distribution(args.receive_drop_chance);
+
+    let mut delayed_receives = futures::stream::FuturesOrdered::new();
+
+    // This function does the meat of processing each packet. Unfortunately, it can be called from more than one
+    // codepath below, and is async, so has to be defined in this inner function that takes like every local variable
+    // as a parameter. Oh, the things I do for perf.
+    //
+    // Returns true if the UDP loop should exit now.
+    async fn handle_receive(
+        mut sb: SourcedBytes,
+        args: &NcArgs,
+        router_sink: &RouterSink,
+        socket_sinks: &mut HashMap<
+            SocketAddr,
+            futures::stream::SplitSink<
+                tokio_util::udp::UdpFramed<BytesCodec, Arc<tokio::net::UdpSocket>>,
+                (Bytes, SocketAddr),
+            >,
+        >,
+        route_db: &Arc<std::sync::RwLock<RouteDb>>,
+        channels: &mut ChannelMap,
+        known_routes: &mut HashSet<RouteId>,
+        local_output_sink_opt: &mut Option<LocalOutputSink>,
+        local_input_driver: &mut LocalInputDriver,
+        stats_tracker: &mut StatsTracker,
+        lifetime_client_count: &mut usize,
+    ) -> bool {
+        if args.verbose {
+            eprintln!("Router handling traffic: {:?}", sb);
+        }
+
+        if args.input_mode == InputMode::PfQosServer {
+            // If this is a valid PfQos request, switch the request header into the response header for sending
+            // back.
+            if sb.data[..PFQOS_FIXED_REQUEST_PREFIX.len()] == PFQOS_FIXED_REQUEST_PREFIX {
+                let mut response_data = BytesMut::from(&sb.data[..]);
+                response_data[..PFQOS_FIXED_RESPONSE_PREFIX.len()]
+                    .copy_from_slice(&PFQOS_FIXED_RESPONSE_PREFIX[..]);
+                sb.data = response_data.freeze();
+            }
+        }
+
+        if sb.route_id == LOCAL_IO_ROUTE_ID {
+            // If local IO sent an empty message, that means it was closed.
+            if args.should_exit_after_input_closed {
+                // Before quitting and therefore disconnecting all the sockets, give a small amount of time to
+                // allow in-flight traffic to be sent.
+                //
+                // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
+                // sent to the network rather than a random delay, but I'm not sure how.
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                return true;
+            }
+        }
+
+        // On every inbound packet, check if we already know about the remote peer who sent it. If not, start
+        // tracking the peer so we can forward traffic to it if needed.
+        //
+        // If joining a multicast group, don't do this, because it'll end up adding duplicate peers who were
+        // going to receive traffic from the multicast group anyway.
+        if !args.should_join_multicast_group
+            && sb.route_id != LOCAL_IO_ROUTE_ID
+            && known_routes.insert(sb.route_id)
+        {
+            *lifetime_client_count += 1;
+
+            print_udp_assoc(route_db.read().unwrap().lookup_addr(sb.route_id));
+
+            if args.is_using_channels() {
+                channels.add_route(sb.route_id, known_routes.iter(), &route_db.read().unwrap());
+            }
+
+            // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
+            // the data out of, say, a redirected input stream, and forward it to nobody, because there are no
+            // other clients.
+            if *lifetime_client_count == 1 && local_output_sink_opt.is_none() {
+                let (local_output_sink, local_input_driver2) =
+                    setup_local_io(args, router_sink.clone());
+                *local_input_driver = local_input_driver2;
+                *local_output_sink_opt = Some(local_output_sink);
+            }
+        }
+
+        let mut broken_routes = RouteIdSet::new();
+        let mut did_send = false;
+
+        // If using channel routing, look up if there's a known channel that this incoming packet should be
+        // forwarded to.
+        if args.is_using_channels() {
+            if let Some(channel_dest) = channels.get_dest_route(sb.route_id) {
+                let channel_dest_route_addr =
+                    route_db.read().unwrap().lookup_addr(channel_dest).clone();
+
+                if args.verbose {
+                    eprintln!(
+                        "Forwarding on channel {} -> {}",
+                        route_db.read().unwrap().lookup_addr(sb.route_id),
+                        channel_dest_route_addr
+                    );
+                }
+
+                // There should always be a backing sink for any channel route.
+                let dest_sink = socket_sinks
+                    .get_mut(&channel_dest_route_addr.local)
+                    .unwrap();
+
+                if let Err(e) = dest_sink
+                    .send((sb.data.clone(), channel_dest_route_addr.peer))
+                    .await
+                {
+                    eprintln!(
+                        "Error forwarding on channel to {}. {}",
+                        channel_dest_route_addr.peer, e
+                    );
+                    broken_routes.insert(channel_dest);
+                } else {
+                    if args.input_mode == InputMode::PfQosClient {
+                        route_db
+                            .write()
+                            .unwrap()
+                            .get_latency_stats_mut(channel_dest)
+                            .record_send(sb.data.clone());
+                    }
+
+                    stats_tracker.record_send(&sb.data);
+                }
+
+                did_send = true;
+            } else {
+                if args.verbose {
+                    eprintln!(
+                        "Dropping message from {}. No channel found.",
+                        route_db.read().unwrap().lookup_addr(sb.route_id)
+                    );
+                }
+            }
+        }
+
+        // If no send happened from channels earlier, try again with regular routing. We shouldn't be in both
+        // hub mode and channel mode, so mostly this covers making sure local input can be sent out, since
+        // it isn't associated with any channel.
+        //
+        // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should go
+        // to. Track any failed sends so they can be pruned from the list of known routes after.
+        if !did_send {
+            for dest_route in known_routes.iter() {
+                let dest_route_addr = route_db.read().unwrap().lookup_addr(*dest_route).clone();
+                if !should_forward_to(args, sb.route_id, *dest_route) {
+                    continue;
+                }
+
+                if args.verbose {
+                    eprintln!("Forwarding to {}", dest_route_addr);
+                }
+
+                if let Some(socket_sink) = socket_sinks.get_mut(&dest_route_addr.local) {
+                    if let Err(e) = socket_sink
+                        .send((sb.data.clone(), dest_route_addr.peer))
+                        .await
+                    {
+                        eprintln!("Error forwarding to {}. {}", dest_route_addr.peer, e);
+                        broken_routes.insert(*dest_route);
+                    } else {
+                        if args.input_mode == InputMode::PfQosClient {
+                            route_db
+                                .write()
+                                .unwrap()
+                                .get_latency_stats_mut(*dest_route)
+                                .record_send(sb.data.clone());
+                        }
+
+                        stats_tracker.record_send(&sb.data);
+                    }
+                } else {
+                    eprintln!("No sink found for {}", dest_route_addr.local);
+                }
+            }
+        }
+
+        // Came from a remote endpoint, so also send to local IO.
+        if sb.route_id != LOCAL_IO_ROUTE_ID {
+            if args.input_mode == InputMode::PfQosClient {
+                let mut route_db_lock = route_db.write().unwrap();
+                let latency_stats = route_db_lock.get_latency_stats_mut(sb.route_id);
+                latency_stats.record_recv(&sb.data, args);
+                if let Some(latest_rtt) = latency_stats.try_get_latest_rtt() {
+                    let route_addr = route_db_lock.lookup_addr(sb.route_id).clone();
+                    eprintln!(
+                        "{} Round trip time: {:>5} ms",
+                        route_addr,
+                        latest_rtt.as_millis()
+                    );
+                }
+            }
+
+            stats_tracker.record_recv(&sb.data);
+
+            if let Some(ref mut local_output_sink) = local_output_sink_opt {
+                // If we hit an error emitting output, clear out the local output sink so we don't bother
+                // trying to output more.
+                if let Err(e) = local_output_sink.send(sb.data.clone()).await {
+                    eprintln!("Local output closed. {}", e);
+                    *local_output_sink_opt = None;
+                }
+            }
+        }
+
+        // If there were any failed sends, clear them out so we don't try to send to them in the future, which
+        // would just result in more errors.
+        if !broken_routes.is_empty() {
+            for route in broken_routes.iter() {
+                known_routes.remove(route);
+
+                if args.is_using_channels() {
+                    if let Some(channel_dest) = channels.get_dest_route(*route) {
+                        channels.remove_route(channel_dest, &route_db.read().unwrap());
+                    }
+                }
+
+                channels.remove_route(*route, &route_db.read().unwrap());
+                route_db.write().unwrap().remove_route(*route);
+            }
+        }
+
+        // TODO: would love to get rid of the duplication between this and TcpRouter, but it's just slightly
+        // different.
+        //
+        // Output throughput stats periodically if requested by the user.
+        if args.should_track_stats {
+            if let Some(stats) = stats_tracker.try_consume_stats() {
+                eprintln!(
+                    "recv {:>12} B/s ({:>7} p/s), send {:>12} B/s ({:>7} p/s)",
+                    stats.recv_byte_count,
+                    stats.recv_count,
+                    stats.send_byte_count,
+                    stats.send_count
+                );
+            }
+        }
+
+        false
+    }
+
     let mut rng = rand::rng();
 
     // Service multiple different event types in a loop. More notes about this in `TcpRouter::service`.
@@ -2088,189 +2441,53 @@ async fn handle_udp_sockets(
                 // The streams in this collection never return error and so should never end.
                 panic!("net_to_router_flow ended! {:?}", result);
             },
-            mut sb = inbound_net_traffic_stream.select_next_some() => {
-                let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
-                if receive_delay != Duration::ZERO {
-                    tokio::time::sleep(receive_delay).await;
-                }
-
+            sb = inbound_net_traffic_stream.select_next_some() => {
+                // Drop this receive if the die roll says to.
                 if get_random_bool(&drop_distribution, &mut rng) {
                     continue;
                 }
 
-                if args.verbose {
-                    eprintln!("Router handling traffic: {:?}", sb);
-                }
-
-                if args.input_mode == InputMode::PfQosServer {
-                    // If this is a valid PfQos request, switch the request header into the response header for sending
-                    // back.
-                    if sb.data[..PFQOS_FIXED_REQUEST_PREFIX.len()] == PFQOS_FIXED_REQUEST_PREFIX {
-                        let mut response_data = BytesMut::from(&sb.data[..]);
-                        response_data[..PFQOS_FIXED_RESPONSE_PREFIX.len()].copy_from_slice(&PFQOS_FIXED_RESPONSE_PREFIX[..]);
-                        sb.data = response_data.freeze();
-                    }
-                }
-
-                if sb.route_id == LOCAL_IO_ROUTE_ID {
-                    // If local IO sent an empty message, that means it was closed.
-                    if args.should_exit_after_input_closed {
-                        // Before quitting and therefore disconnecting all the sockets, give a small amount of time to
-                        // allow in-flight traffic to be sent.
-                        //
-                        // TODO: Ideally we'd have some way to figuring this out by tracking when bytes have been
-                        // sent to the network rather than a random delay, but I'm not sure how.
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // If a delay should be added to this receive, essentially re-queue it for processing after the required
+                // delay. But if there was no delay, skip going to the queue and service it immediately.
+                let receive_delay = get_random_duration(&delay_range, &delay_distribution, &mut rng);
+                if receive_delay != Duration::ZERO {
+                    delayed_receives.push_back(async move {
+                        tokio::time::sleep(receive_delay).await;
+                        sb
+                    });
+                } else {
+                    if handle_receive(
+                        sb,
+                        &args,
+                        &router_sink,
+                        &mut socket_sinks,
+                        &route_db,
+                        &mut channels,
+                        &mut known_routes,
+                        &mut local_output_sink_opt,
+                        &mut local_input_driver,
+                        &mut stats_tracker,
+                        &mut lifetime_client_count).await {
                         return Ok(());
                     }
                 }
+            }
 
-                // On every inbound packet, check if we already know about the remote peer who sent it. If not, start
-                // tracking the peer so we can forward traffic to it if needed.
-                //
-                // If joining a multicast group, don't do this, because it'll end up adding duplicate peers who were
-                // going to receive traffic from the multicast group anyway.
-                if !args.should_join_multicast_group && sb.route_id != LOCAL_IO_ROUTE_ID && known_routes.insert(sb.route_id) {
-                    lifetime_client_count += 1;
-
-                    print_udp_assoc(route_db.read().unwrap().lookup_addr(sb.route_id));
-
-                    if args.is_using_channels() {
-                        channels.add_route(sb.route_id, known_routes.iter(), &route_db.read().unwrap());
-                    }
-
-                    // Don't add the local IO hookup until the first client is added, otherwise the router will pull all
-                    // the data out of, say, a redirected input stream, and forward it to nobody, because there are no
-                    // other clients.
-                    if lifetime_client_count == 1 && local_output_sink_opt.is_none() {
-                        let (local_output_sink, local_input_driver2) = setup_local_io(args, router_sink.clone());
-                        local_input_driver = local_input_driver2;
-                        local_output_sink_opt = Some(local_output_sink);
-                    }
-                }
-
-                let mut broken_routes = RouteIdSet::new();
-                let mut did_send = false;
-
-                // If using channel routing, look up if there's a known channel that this incoming packet should be
-                // forwarded to.
-                if args.is_using_channels() {
-                    if let Some(channel_dest) = channels.get_dest_route(sb.route_id) {
-                        let channel_dest_route_addr = route_db.read().unwrap().lookup_addr(channel_dest).clone();
-
-                        if args.verbose {
-                            eprintln!("Forwarding on channel {} -> {}", route_db.read().unwrap().lookup_addr(sb.route_id), channel_dest_route_addr);
-                        }
-
-                        // There should always be a backing sink for any channel route.
-                        let dest_sink = socket_sinks.get_mut(&channel_dest_route_addr.local).unwrap();
-
-                        if let Err(e) = dest_sink.send((sb.data.clone(), channel_dest_route_addr.peer)).await {
-                            eprintln!("Error forwarding on channel to {}. {}", channel_dest_route_addr.peer, e);
-                            broken_routes.insert(channel_dest);
-                        } else {
-                            if args.input_mode == InputMode::PfQosClient {
-                                route_db.write().unwrap().get_latency_stats_mut(channel_dest).record_send(sb.data.clone());
-                            }
-
-                            stats_tracker.record_send(&sb.data);
-                        }
-
-                        did_send = true;
-                    } else {
-                        if args.verbose {
-                            eprintln!("Dropping message from {}. No channel found.", route_db.read().unwrap().lookup_addr(sb.route_id));
-                        }
-                    }
-                }
-
-                // If no send happened from channels earlier, try again with regular routing. We shouldn't be in both
-                // hub mode and channel mode, so mostly this covers making sure local input can be sent out, since
-                // it isn't associated with any channel.
-                //
-                // Broadcast any incoming data back to whichever other connected sockets and/or local IO it should go
-                // to. Track any failed sends so they can be pruned from the list of known routes after.
-                if !did_send {
-                    for dest_route in known_routes.iter() {
-                        let dest_route_addr = route_db.read().unwrap().lookup_addr(*dest_route).clone();
-                        if !should_forward_to(args, sb.route_id, *dest_route) {
-                            continue;
-                        }
-
-                        if args.verbose {
-                            eprintln!("Forwarding to {}", dest_route_addr);
-                        }
-
-                        if let Some(socket_sink) = socket_sinks.get_mut(&dest_route_addr.local) {
-                            if let Err(e) = socket_sink.send((sb.data.clone(), dest_route_addr.peer)).await {
-                                eprintln!("Error forwarding to {}. {}", dest_route_addr.peer, e);
-                                broken_routes.insert(*dest_route);
-                            } else {
-                                if args.input_mode == InputMode::PfQosClient {
-                                    route_db.write().unwrap().get_latency_stats_mut(*dest_route).record_send(sb.data.clone());
-                                }
-
-                                stats_tracker.record_send(&sb.data);
-                            }
-                        } else {
-                            eprintln!("No sink found for {}", dest_route_addr.local);
-                        }
-                    }
-                }
-
-                // Came from a remote endpoint, so also send to local IO.
-                if sb.route_id != LOCAL_IO_ROUTE_ID {
-                    if args.input_mode == InputMode::PfQosClient {
-                        let mut route_db_lock = route_db.write().unwrap();
-                        let latency_stats = route_db_lock.get_latency_stats_mut(sb.route_id);
-                        latency_stats.record_recv(&sb.data, args);
-                        if let Some(latest_rtt) = latency_stats.try_get_latest_rtt() {
-                            let route_addr = route_db_lock.lookup_addr(sb.route_id).clone();
-                            eprintln!("{} Round trip time: {:>5} ms", route_addr, latest_rtt.as_millis());
-                        }
-                    }
-
-                    stats_tracker.record_recv(&sb.data);
-
-                    if let Some(ref mut local_output_sink) = local_output_sink_opt {
-                        // If we hit an error emitting output, clear out the local output sink so we don't bother
-                        // trying to output more.
-                        if let Err(e) = local_output_sink.send(sb.data.clone()).await {
-                            eprintln!("Local output closed. {}", e);
-                            local_output_sink_opt = None;
-                        }
-                    }
-                }
-
-                // If there were any failed sends, clear them out so we don't try to send to them in the future, which
-                // would just result in more errors.
-                if !broken_routes.is_empty() {
-                    for route in broken_routes.iter() {
-                        known_routes.remove(route);
-
-                        if args.is_using_channels() {
-                            if let Some(channel_dest) = channels.get_dest_route(*route) {
-                                channels.remove_route(channel_dest, &route_db.read().unwrap());
-                            }
-                        }
-
-                        channels.remove_route(*route, &route_db.read().unwrap());
-                        route_db.write().unwrap().remove_route(*route);
-                    }
-                }
-
-                // TODO: would love to get rid of the duplication between this and TcpRouter, but it's just slightly
-                // different.
-                //
-                // Output throughput stats periodically if requested by the user.
-                if args.should_track_stats {
-                    if let Some(stats) = stats_tracker.try_consume_stats() {
-                        eprintln!("recv {:>12} B/s ({:>7} p/s), send {:>12} B/s ({:>7} p/s)",
-                            stats.recv_byte_count,
-                            stats.recv_count,
-                            stats.send_byte_count,
-                            stats.send_count);
-                    }
+            // Handle any re-queued receives due to induced delays.
+            sb = delayed_receives.select_next_some() => {
+                if handle_receive(
+                    sb,
+                    &args,
+                    &router_sink,
+                    &mut socket_sinks,
+                    &route_db,
+                    &mut channels,
+                    &mut known_routes,
+                    &mut local_output_sink_opt,
+                    &mut local_input_driver,
+                    &mut stats_tracker,
+                    &mut lifetime_client_count).await {
+                    return Ok(());
                 }
             },
             _result = &mut local_input_driver => {
@@ -2394,10 +2611,12 @@ about,
 long_about = None,
 disable_help_flag = true,
 override_usage =
-r#"connect outbound: nc [options] HOST:PORT[xMult] [HOST:PORT[xMult] ...]
+r#"connect outbound: nc [options] [SOURCE_HOST:PORT=]HOST:PORT[xMult] [[SOURCE_HOST:PORT=]HOST:PORT[xMult] ...]
        listen for inbound: nc [[-l | -L] ADDR:PORT ...] [options]"#,
 after_help =
-r#"For -l, -L, and -s, a few formats of ADDR:PORT are supported:
+r#"The SOURCE_HOST:PORT= syntax allows specifying the source address for connecting to that destination address. If omitted, a default unspecified address is used.
+
+For -l and -L, a few formats of ADDR:PORT are supported:
 - HOST:PORT - standard format, anything that can be parsed as a local address, including DNS lookup
 - :PORT - automatically enumerates all local addresses
 - *:PORT - uses the wildcard IPv4 and IPv6 addresses (0.0.0.0 and [::]) with the specified port
@@ -2426,10 +2645,6 @@ pub struct NcArgs {
     /// Max incoming clients allowed to be connected at the same time. (TCP only).
     #[arg(short = 'm', conflicts_with = "is_udp")]
     max_inbound_connections: Option<usize>,
-
-    /// Source address to bind to for outbound connections
-    #[arg(short = 's', value_name = "ADDR:PORT")]
-    outbound_source_host_opt: Option<String>,
 
     /// Forwarding mode
     #[arg(short = 'f', long = "fm", value_enum, default_value_t = ForwardingMode::Null)]
@@ -2495,7 +2710,7 @@ pub struct NcArgs {
     #[arg(
         long = "sdrop",
         alias = "send-drop-chance",
-        value_name = "MS",
+        value_name = "PROB",
         default_value_t = 0.0
     )]
     send_drop_chance: f64,
@@ -2504,7 +2719,7 @@ pub struct NcArgs {
     #[arg(
         long = "rdrop",
         alias = "receive-drop-chance",
-        value_name = "MS",
+        value_name = "PROB",
         default_value_t = 0.0
     )]
     receive_drop_chance: f64,
@@ -2661,9 +2876,14 @@ async fn async_main() -> Result<(), String> {
 
     if !args.targets.is_empty() {
         eprintln!("Targets:");
+
+        let mut local_addrs_opt = None;
         for target in args.targets.iter() {
             let mut target: &str = &target;
             let mut multiplier = 1;
+
+            // Empty source address will be interpreted as using local addresses.
+            let mut source_addr_str: &str = "";
 
             // Check and see if the user appended x123 or whatever as a multiplier at the end of the target string.
             if let Some(captures) = TARGET_MULTIPLIER_REGEX.captures_iter(&target).next() {
@@ -2672,23 +2892,74 @@ async fn async_main() -> Result<(), String> {
                 let before_match = &target[..captures.get(0).unwrap().start()];
 
                 // Get the first capture, which should be the multiplier string.
-                if let Some(multiplier_match) = captures.get(1) {
-                    // Unwrap is OK here because the regex validated that this is a number only.
-                    multiplier = multiplier_match.as_str().parse::<u32>().unwrap();
-                    target = before_match;
+                let Some(multiplier_match) = captures.get(1) else {
+                    panic!("matched multiplier regex without captures");
+                };
+
+                // Unwrap is OK here because the regex validated that this is a number only.
+                multiplier = multiplier_match.as_str().parse::<u32>().unwrap();
+                target = before_match;
+            }
+
+            // Attempt to split the target with an = in the middle, which denotes that there is a source address paired
+            // with this target.
+            if let Some(captures) = TARGET_SOURCE_ADDR_REGEX.captures_iter(&target).next() {
+                let Some(source_addr_match) = captures.get(1) else {
+                    panic!("matched source addr regex without captures");
+                };
+
+                let Some(dest_addr_match) = captures.get(2) else {
+                    panic!("matched source addr regex without captures");
+                };
+
+                source_addr_str = source_addr_match.as_str();
+                target = dest_addr_match.as_str();
+            }
+
+            // Construct a set of source addresses for this target. If nothing was specified, default to the regular set
+            // of local addresses. If one was specified, resolve it and use it.
+            let source_addrs = if source_addr_str == "" {
+                if local_addrs_opt.is_none() {
+                    local_addrs_opt = Some(
+                        get_local_addrs(std::iter::empty::<&str>(), true, &args)
+                            .await
+                            .map_err(format_io_err)?,
+                    );
+                }
+
+                local_addrs_opt.as_ref().unwrap().clone()
+            } else {
+                get_local_addrs(std::iter::once(source_addr_str), false, &args)
+                    .await
+                    .map_err(format_io_err)?
+            };
+
+            let mut ct = ConnectionTarget::new(target, &source_addrs, &args)
+                .await
+                .map_err(format_io_err)?;
+
+            // When joining a multicast group, by default you will send traffic to the group but won't receive it unless
+            // also bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to,
+            // choose the outbound multicast port because it's probably what they actually wanted.
+            if args.should_join_multicast_group && source_addr_str == "" {
+                let target_port = ct.dest_addrs[0].port();
+
+                // Update every source address to use the multicast group's destination address.
+                for source_addr in ct.source_addrs.iter_mut() {
+                    source_addr.set_port(target_port);
                 }
             }
 
-            let ct = ConnectionTarget::new(target).await.map_err(format_io_err)?;
             if multiplier != 1 {
                 eprintln!("{}x {}", multiplier, ct);
             } else {
                 eprintln!("{}", ct);
             }
 
-            for _ in 0..multiplier {
+            for _ in 0..multiplier - 1 {
                 targets.push(ct.clone());
             }
+            targets.push(ct);
         }
     }
 
@@ -2703,28 +2974,6 @@ async fn async_main() -> Result<(), String> {
     if args.receive_drop_chance > 1.0 || args.receive_drop_chance < 0.0 {
         usage("Invalid receive drop chance. Must be from 0.0 to 1.0.");
     }
-
-    // When joining a multicast group, by default you will send traffic to the group but won't receive it unless also
-    // bound to the port you're sending to. If the user didn't explicitly choose a local port to bind to, choose the
-    // outbound multicast port because it's probably what they actually wanted.
-    if args.should_join_multicast_group && args.outbound_source_host_opt.is_none() {
-        if let Some(first_target) = &targets.first() {
-            if let Some(first_target_addr) = &first_target.addrs.iter().take(1).next() {
-                args.outbound_source_host_opt = Some(format!("*:{}", first_target_addr.port()));
-            }
-        }
-    }
-
-    // Option::iter() makes an iterator that yields either 0 or 1 item, depending on if it's None or Some. The `true`
-    // param for get_local_addrs tells it to automatically include the wildcard local address if no source addresses
-    // were explicitly specified.
-    let outbound_source_addrs = get_local_addrs(
-        args.outbound_source_host_opt.iter().map(String::as_str),
-        true,
-        &args,
-    )
-    .await
-    .map_err(format_io_err)?;
 
     // Should be handled by the conflicts_with attribute above.
     assert!(args.listen_once.is_empty() || args.listen_many.is_empty());
@@ -2758,9 +3007,9 @@ async fn async_main() -> Result<(), String> {
     }
 
     let result = if args.is_udp {
-        do_udp(&listen_addrs, &outbound_source_addrs, &targets, &args).await
+        do_udp(&listen_addrs, &targets, &args).await
     } else {
-        do_tcp(&listen_addrs, &outbound_source_addrs, &targets, &args).await
+        do_tcp(&listen_addrs, &targets, &args).await
     };
 
     result.map_err(format_io_err)
